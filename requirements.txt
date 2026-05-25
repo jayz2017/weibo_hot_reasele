@@ -1,0 +1,8 @@
+playwright
+requests
+beautifulsoup4
+lxml
+pandas
+Pillow
+pyyaml
+aiohttp
