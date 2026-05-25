@@ -25,12 +25,14 @@ class StorageManager(BaseSkill):
     def __init__(self, config: Dict[str, Any], logger: logging.Logger):
         storage_config = config.get('storage', {})
         base_dir = Path(storage_config.get('base_dir', './data'))
-        
+
+        paths_config = config.get('paths', {})
+        screenshot_base = Path(paths_config.get('screenshot_dir', str(base_dir / 'screenshots')))
+
         self.raw_dir = base_dir / storage_config.get('raw_data_dir', 'raw')
         self.processed_dir = base_dir / storage_config.get('processed_data_dir', 'processed')
-        self.screenshots_dir = base_dir / 'screenshots'
-        
-        # 确保目录存在
+        self.screenshots_dir = screenshot_base
+
         ensure_dir(str(self.raw_dir))
         ensure_dir(str(self.processed_dir))
         ensure_dir(str(self.screenshots_dir / 'articles'))

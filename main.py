@@ -192,7 +192,7 @@ def main():
             
         elif args.mode == 'hotsearch':
             asyncio.run(run_hotsearch_only(args.config))
-            
+
         elif args.mode == 'full':
             exit_code = asyncio.run(run_full_pipeline(args.config, headless))
             sys.exit(exit_code)

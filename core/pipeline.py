@@ -19,6 +19,7 @@ from utils.file_utils import clean_filename, generate_filename
 from utils.http_client import HTTPClient
 from models.article_model import ArticleModel
 from models.comment_model import CommentModel
+from utils.mysql_manager import MySQLManager
 
 
 class PipelineManager:
@@ -28,7 +29,7 @@ class PipelineManager:
         self.config_manager = ConfigManager(config_path)
         self.config = self.config_manager.config
 
-        log_dir = Path("./data/logs")
+        log_dir = Path(self.config.get('paths', {}).get('log_dir', './data/logs'))
         log_dir.mkdir(parents=True, exist_ok=True)
         self.logger = _setup_logger(
             "Pipeline",
@@ -50,6 +51,10 @@ class PipelineManager:
 
         self._initialize_skills()
 
+        paths_config = self.config.get('paths', {})
+        self.screenshot_dir = Path(paths_config.get('screenshot_dir', './data/screenshots'))
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+
     def _initialize_skills(self):
         self.logger.info("正在初始化所有Skills...")
         try:
@@ -60,6 +65,13 @@ class PipelineManager:
             self.comment_screenshot = CommentScreenshot(self.config, self.logger, self.browser)
             self.data_extractor = DataExtractor(self.config, self.logger)
             self.storage = StorageManager(self.config, self.logger)
+
+            mysql_config = self.config.get('mysql', {})
+            if mysql_config.get('enabled', False):
+                self.mysql = MySQLManager(mysql_config, self.logger)
+                self.logger.info("[MySQL] 数据库连接初始化完成")
+            else:
+                self.mysql = None
 
             self.skills = {
                 'crawler': self.crawler,
@@ -134,6 +146,15 @@ class PipelineManager:
 
             for article in cleaned_articles:
                 self.storage.save_article_data(article, article.keyword)
+                if self.mysql:
+                    try:
+                        article_id = self.mysql.save_article(article.to_dict())
+                        article_comments = [c for c in cleaned_comments if hasattr(c, 'article_url') and c.article_url == article.url]
+                        if article_comments:
+                            comments_data = [c.to_dict() for c in article_comments]
+                            self.mysql.save_comments_batch(comments_data, article_id)
+                    except Exception as db_err:
+                        self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
 
             if cleaned_comments:
                 self.storage.save_comments_data(cleaned_comments, "all_collected")
@@ -176,6 +197,8 @@ class PipelineManager:
         finally:
             await self.browser.close_browser()
             self.crawler.close()
+            if self.mysql:
+                self.mysql.close()
 
     async def _process_keyword(self, keyword: str, word_scheme: str = ""):
         """
@@ -214,7 +237,7 @@ class PipelineManager:
                 safe_kw = clean_filename(keyword[:20])
                 screenshot_name = generate_filename(safe_kw, 'login_required', '.png')
                 screenshot_path = str(
-                    Path(self.config.get('storage', {}).get('base_dir', './data')) / 'screenshots' / 'articles' / screenshot_name
+                    self.screenshot_dir / 'articles' / screenshot_name
                 )
                 await self.browser.take_screenshot(search_page, screenshot_path, full_page=False)
                 article = ArticleModel(
@@ -238,7 +261,7 @@ class PipelineManager:
                 self.logger.warning(f"    未找到微博卡片元素，保存整页截图")
                 search_screenshot_name = generate_filename(safe_kw, 'search_page', '.png')
                 search_screenshot_path = str(
-                    Path(self.config.get('storage', {}).get('base_dir', './data')) / 'screenshots' / 'articles' / search_screenshot_name
+                    self.screenshot_dir / 'articles' / search_screenshot_name
                 )
                 await self.browser.take_screenshot(search_page, search_screenshot_path, full_page=True)
                 article = ArticleModel(
@@ -279,7 +302,7 @@ class PipelineManager:
 
                     article_screenshot_name = generate_filename(safe_kw, f'article_{i}', '.png')
                     article_screenshot_path = str(
-                        Path(self.config.get('storage', {}).get('base_dir', './data')) / 'screenshots' / 'articles' / article_screenshot_name
+                        self.screenshot_dir / 'articles' / article_screenshot_name
                     )
 
                     card_box = await search_page.evaluate(f"""
@@ -822,7 +845,7 @@ class PipelineManager:
 
                     comment_screenshot_name = generate_filename(safe_kw, f'comment_{article_index}_{seq}', '.png')
                     comment_screenshot_path = str(
-                        Path(self.config.get('storage', {}).get('base_dir', './data')) / 'screenshots' / 'comments' / comment_screenshot_name
+                        self.screenshot_dir / 'comments' / comment_screenshot_name
                     )
 
                     Path(comment_screenshot_path).parent.mkdir(parents=True, exist_ok=True)
@@ -885,7 +908,7 @@ class PipelineManager:
     async def _save_comment_area_fallback(self, page, keyword: str, article_index: int, safe_kw: str):
         comment_screenshot_name = generate_filename(safe_kw, f'comment_area_{article_index}', '.png')
         comment_screenshot_path = str(
-            Path(self.config.get('storage', {}).get('base_dir', './data')) / 'screenshots' / 'comments' / comment_screenshot_name
+            self.screenshot_dir / 'comments' / comment_screenshot_name
         )
 
         fallback_box = await page.evaluate("""
@@ -920,6 +943,15 @@ class PipelineManager:
             articles, comments = await self._process_keyword(keyword)
             for article in articles:
                 self.storage.save_article_data(article, keyword)
+                if self.mysql:
+                    try:
+                        article_id = self.mysql.save_article(article.to_dict())
+                        article_comments = [c for c in comments if hasattr(c, 'article_url') and c.article_url == article.url]
+                        if article_comments:
+                            comments_data = [c.to_dict() for c in article_comments]
+                            self.mysql.save_comments_batch(comments_data, article_id)
+                    except Exception as db_err:
+                        self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
             if comments:
                 self.storage.save_comments_data(comments, keyword)
             self.logger.info(f"✓ 单关键词处理完成: {keyword}")
@@ -927,3 +959,5 @@ class PipelineManager:
         finally:
             await self.browser.close_browser()
             self.crawler.close()
+            if self.mysql:
+                self.mysql.close()

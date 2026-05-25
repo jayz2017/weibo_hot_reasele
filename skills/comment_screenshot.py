@@ -27,8 +27,9 @@ class CommentScreenshot(BaseSkill):
     def __init__(self, config: Dict[str, Any], logger: logging.Logger,
                  browser_controller: Optional[BrowserController] = None):
         self.browser = browser_controller
-        storage_config = config.get('storage', {})
-        self.screenshot_dir = Path(storage_config.get('base_dir', './data')) / 'screenshots' / 'comments'
+        paths_config = config.get('paths', {})
+        screenshot_base = Path(paths_config.get('screenshot_dir', './data/screenshots'))
+        self.screenshot_dir = screenshot_base / 'comments'
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         
         comment_config = config.get('comment', {})

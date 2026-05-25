@@ -2,6 +2,11 @@ app:
   name: weibo_hot_reasele
   version: 1.0.0
 
+paths:
+  screenshot_dir: "G:\\weibo_hot\\png"
+  log_dir: "G:\\weibo_hot\\log"
+  data_dir: "./data"
+
 crawler:
   hotsearch_api: "https://weibo.com/ajax/side/hotSearch"
   search_url_template: "https://s.weibo.com/weibo?q={keyword}"
@@ -37,9 +42,6 @@ browser:
   screenshot_type: png
   wait_timeout: 15000
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  # 微博Cookie（必填！从浏览器登录微博后复制Cookie）
-  # 获取方式：浏览器登录weibo.com → F12 → Network → 任意请求 → 复制Cookie值
-  # 格式: "SUB=xxx; SUBP=xxx; ..."
   cookie: "SCF=ApfrSGyMKoNeLxNnMmeRF9pjBylFlutXxYlMkoT5N4vFmn51x-D1dtmyEWzgX4u4-GrpBCvrtcUB5N38y3MD3nE.; SUB=_2A25HFVh4DeRhGeNL7FUZ8S_OyzWIHXVka9WwrDV8PUNbmtAYLVDykW9NSPGimVtfWw3G8LCqqebKcoue_pQSsStI; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9WhFuak_ui-GHnov__6UcYhk5NHD95QfSKMN1h2peo54Ws4Dqcj_i--Ni-8si-88i--NiK.7iKn0i--fiKn4iKy2i--NiKL8i-iFi--fiK.7iKLF; ALF=02_1782101288; SINAGLOBAL=6597216078207.407.1779509288468; ULV=1779509288470:1:1:1:6597216078207.407.1779509288468:; XSRF-TOKEN=rvKN9eB4XAtPdmD9bLg2wmhg; WBPSESS=KmkcCC-NOyl7Vstvd_nzSEI3U7Zngq67yZH8IcUkrIu0jj2OrR6vx3HZbt_5I6pfbeOBwlxFxgNk8IFaw3yCcHkerLImsge1ghUpXfAAa1lXnBXhD4EtYF6N6qNohX3o2esB02mxaCVT00I35Jmgpw=="
 
 storage:
@@ -51,8 +53,8 @@ storage:
   enable_backup: true
 
 screenshot:
-  articles_dir: "data/screenshots/articles"
-  comments_dir: "data/screenshots/comments"
+  articles_dir: "articles"
+  comments_dir: "comments"
   format: png
   quality: 90
   delay_before_screenshot: 2000
@@ -60,6 +62,10 @@ screenshot:
 comment:
   max_comments: 20
   load_more_times: 3
+
+author_monitor:
+  monitor_minutes: 30
+  max_articles_per_author: 5
 
 extract:
   max_text_length: 5000
@@ -73,3 +79,12 @@ logging:
 pipeline:
   max_keywords: 5
   articles_per_keyword: 3
+
+mysql:
+  enabled: true
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "Jockson2021@@"
+  database: "sport_zhiboba_text"
+  charset: "utf8mb4"
