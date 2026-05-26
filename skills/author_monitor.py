@@ -150,13 +150,25 @@ class AuthorMonitor:
 
             page_author_name = await page.evaluate("""
                 () => {
-                    const nameEl = document.querySelector('.ProfileHeader_name, .user_name, h1[class*="name"], [class*="UserName"]');
+                    const nameEl = document.querySelector('.ProfileHeader_name, .user_name, h1[class*="name"], [class*="UserName"], [class*="username"]');
                     if (nameEl) return nameEl.innerText.trim();
+                    const metaEl = document.querySelector('meta[property="og:title"]');
+                    if (metaEl && metaEl.content) return metaEl.content.trim();
                     const titleEl = document.querySelector('title');
                     if (titleEl) {
                         const text = titleEl.innerText || '';
-                        const parts = text.split('-');
-                        if (parts.length > 0) return parts[0].trim();
+                        if (text.includes('的微博')) {
+                            return text.split('的微博')[0].trim();
+                        }
+                        if (text.includes('-')) {
+                            const parts = text.split('-');
+                            for (let i = 0; i < parts.length; i++) {
+                                const p = parts[i].trim();
+                                if (p && p !== '微博' && p !== '随时随地发现新鲜事' && !p.includes('weibo')) {
+                                    return p;
+                                }
+                            }
+                        }
                     }
                     return '';
                 }
@@ -237,12 +249,10 @@ class AuthorMonitor:
         return articles, comments
 
     async def _get_recent_posts(self, page, author_name: str = '') -> List[Dict]:
-        cutoff_time = datetime.now() - timedelta(minutes=self.monitor_minutes)
-
         posts_data = await page.evaluate("""
             () => {
                 const results = [];
-                const items = document.querySelectorAll('.wbpro-scroller-item, .card-wrap, [class*="FeedItem"], [class*="feed_item"]');
+                const items = document.querySelectorAll('.wbpro-scroller-item');
                 
                 for (let i = 0; i < items.length; i++) {
                     const item = items[i];
@@ -250,29 +260,81 @@ class AuthorMonitor:
                         const data = {};
                         data.index = i;
                         
-                        const card = item.querySelector('.card-wrap') || item;
-                        
-                        const txtEl = card.querySelector('.txt, p[node-type="feed_list_content"], [class*="text"], [class*="content"]');
+                        const txtEl = item.querySelector('.txt, p[node-type="feed_list_content"], [class*="text"], [class*="content"]');
                         data.content_text = txtEl ? txtEl.innerText.trim() : (item.innerText || '').substring(0, 200).trim();
                         
-                        const timeEl = card.querySelector('.from a:first-child, [class*="time"], [class*="date"], time');
-                        data.publish_time = timeEl ? timeEl.innerText.trim() : '';
-                        
-                        const headEl = card.querySelector('.from a:last-child, a[href*="weibo.com/"]');
-                        data.detail_url = headEl ? headEl.href : '';
-                        
-                        if (!data.detail_url || data.detail_url.includes('app.weibo.com') || data.detail_url.startsWith('javascript:')) {
-                            const detailLink = card.querySelector('a[href*="weibo.com/"][href*="/R"], a[href*="weibo.com/"][href*="/r"]');
-                            if (detailLink) data.detail_url = detailLink.href;
+                        let timeText = '';
+                        const headInfoEl = item.querySelector('.head-info, [class*="head-info"], [class*="HeadInfo"]');
+                        if (headInfoEl) {
+                            timeText = headInfoEl.innerText.trim();
                         }
-                        if (!data.detail_url || data.detail_url.includes('app.weibo.com') || data.detail_url.startsWith('javascript:')) {
-                            const timeLink = card.querySelector('.from a[href*="weibo.com/"]');
-                            if (timeLink && !timeLink.href.includes('/u/') && !timeLink.href.includes('/p/')) {
-                                data.detail_url = timeLink.href;
+                        if (!timeText) {
+                            const timeEl = item.querySelector('a[href*="weibo.com/"] [class*="time"], a[class*="time"], [class*="time"], [class*="date"], time, .from a:first-child');
+                            if (timeEl) timeText = timeEl.innerText.trim();
+                        }
+                        if (!timeText) {
+                            const allLinks = item.querySelectorAll('a');
+                            for (const link of allLinks) {
+                                const href = link.href || '';
+                                const text = link.innerText.trim();
+                                if (href && !href.includes('/u/') && !href.includes('/p/') && 
+                                    !href.includes('/follow') && !href.includes('/fans') &&
+                                    (text.includes('分钟前') || text.includes('刚刚') || text.includes('秒前') ||
+                                     text.includes('小时前') || text.includes('今天') || text.includes('月'))) {
+                                    timeText = text;
+                                    break;
+                                }
                             }
                         }
+                        if (!timeText) {
+                            const spans = item.querySelectorAll('span, a');
+                            for (const sp of spans) {
+                                const t = sp.innerText.trim();
+                                if (t && (t.includes('分钟前') || t.includes('刚刚') || t.includes('秒前') ||
+                                          t.includes('小时前') || t.includes('今天') || /\\d+月\\d+日/.test(t))) {
+                                    timeText = t;
+                                    break;
+                                }
+                            }
+                        }
+                        data.publish_time = timeText;
                         
-                        const actEls = card.querySelectorAll('.card-act li, [class*="action"] li, [class*="toolbar"] span');
+                        let detailUrl = '';
+                        const timeLinks = item.querySelectorAll('a[href*="weibo.com/"]');
+                        for (const link of timeLinks) {
+                            const href = link.href || '';
+                            if (href.includes('/u/') || href.includes('/p/') || 
+                                href.includes('/follow') || href.includes('/fans') ||
+                                href.includes('/signup') || href.includes('/login') ||
+                                href.startsWith('javascript:')) continue;
+                            if (href.match(/weibo\\.com\\/\\d+\\/[a-zA-Z0-9]+/)) {
+                                detailUrl = href;
+                                break;
+                            }
+                        }
+                        if (!detailUrl) {
+                            for (const link of timeLinks) {
+                                const href = link.href || '';
+                                if (href.includes('/u/') || href.includes('/p/') || 
+                                    href.includes('/follow') || href.includes('/fans') ||
+                                    href.startsWith('javascript:')) continue;
+                                const text = link.innerText.trim();
+                                if (text && (text.includes('分钟前') || text.includes('刚刚') || text.includes('秒前') ||
+                                             text.includes('小时前') || text.includes('今天') || text.includes('月'))) {
+                                    detailUrl = href;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!detailUrl) {
+                            const fromLink = item.querySelector('.from a:last-child, a[href*="weibo.com/"]');
+                            if (fromLink && !fromLink.href.includes('/u/') && !fromLink.href.includes('/p/')) {
+                                detailUrl = fromLink.href;
+                            }
+                        }
+                        data.detail_url = detailUrl;
+                        
+                        const actEls = item.querySelectorAll('.card-act li, [class*="action"] li, [class*="toolbar"] span, [class*="woo-like"], [class*="interaction"]');
                         if (actEls.length >= 3) {
                             data.repost_count = parseInt(actEls[0]?.innerText) || 0;
                             data.comment_count = parseInt(actEls[1]?.innerText) || 0;
@@ -293,18 +355,29 @@ class AuthorMonitor:
         """)
 
         if not posts_data:
+            self.logger.info(f"[AuthorMonitor] 作者主页未解析到任何微博内容")
             return []
+
+        self.logger.info(f"[AuthorMonitor] 作者主页解析到 {len(posts_data)} 条微博，开始时间过滤(≤{self.monitor_minutes}分钟)")
 
         recent_posts = []
         for post in posts_data:
             pub_time_str = post.get('publish_time', '')
-            if self._is_recent(pub_time_str):
+            content_preview = post.get('content_text', '')[:40]
+            detail_url = post.get('detail_url', '')
+            is_recent = self._is_recent(pub_time_str)
+
+            self.logger.info(f"  📋 微博[{post.get('index', '?')}] time=\"{pub_time_str}\" recent={is_recent} url={detail_url[:60] if detail_url else 'N/A'}")
+            self.logger.info(f"     内容: {content_preview}...")
+
+            if is_recent:
                 recent_posts.append(post)
 
         if not recent_posts:
-            self.logger.info(f"[AuthorMonitor] 未找到最近{self.monitor_minutes}分钟内的更新，取前{self.max_articles_per_author}条")
-            return posts_data[:self.max_articles_per_author]
+            self.logger.info(f"[AuthorMonitor] 最近{self.monitor_minutes}分钟内无更新，跳过该作者")
+            return []
 
+        self.logger.info(f"[AuthorMonitor] 筛选出 {len(recent_posts)} 条最近{self.monitor_minutes}分钟内的更新")
         return recent_posts
 
     def _is_recent(self, time_str: str) -> bool:
@@ -320,12 +393,17 @@ class AuthorMonitor:
             elif '今天' in time_str:
                 time_part = time_str.replace('今天', '').strip()
                 if time_part:
-                    pub_time = datetime.strptime(time_part, '%H:%M')
+                    try:
+                        pub_time = datetime.strptime(time_part, '%H:%M')
+                    except ValueError:
+                        pub_time = datetime.strptime(time_part, '%H:%M:%S')
                     pub_datetime = now.replace(hour=pub_time.hour, minute=pub_time.minute, second=0)
                     return (now - pub_datetime).total_seconds() <= self.monitor_minutes * 60
             elif '小时前' in time_str:
                 hours = int(''.join(c for c in time_str if c.isdigit()) or '0')
                 return hours * 60 <= self.monitor_minutes
+            elif '昨天' in time_str:
+                return False
             else:
                 try:
                     pub_time = datetime.strptime(time_str, '%m月%d日 %H:%M')
@@ -333,62 +411,207 @@ class AuthorMonitor:
                     return (now - pub_datetime).total_seconds() <= self.monitor_minutes * 60
                 except ValueError:
                     pass
+                try:
+                    pub_time = datetime.strptime(time_str, '%m月%d日 %H:%M:%S')
+                    pub_datetime = pub_time.replace(year=now.year)
+                    return (now - pub_datetime).total_seconds() <= self.monitor_minutes * 60
+                except ValueError:
+                    pass
+                try:
+                    pub_time = datetime.strptime(time_str, '%Y年%m月%d日 %H:%M')
+                    return (now - pub_time).total_seconds() <= self.monitor_minutes * 60
+                except ValueError:
+                    pass
+                try:
+                    import re
+                    match = re.search(r'(\d+)月(\d+)日\s*(\d+):(\d+)', time_str)
+                    if match:
+                        month, day, hour, minute = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+                        pub_datetime = now.replace(month=month, day=day, hour=hour, minute=minute, second=0)
+                        return (now - pub_datetime).total_seconds() <= self.monitor_minutes * 60
+                except Exception:
+                    pass
+                try:
+                    import re
+                    match = re.search(r'(\d+)-(\d+)\s+(\d+):(\d+)', time_str)
+                    if match:
+                        month, day, hour, minute = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+                        pub_datetime = now.replace(month=month, day=day, hour=hour, minute=minute, second=0)
+                        return (now - pub_datetime).total_seconds() <= self.monitor_minutes * 60
+                except Exception:
+                    pass
         except Exception:
             pass
         return False
 
     async def _screenshot_post_card(self, page, card_index: int, screenshot_path: str) -> bool:
         try:
+            self.logger.info(f"    🔍 [文章截图] 开始 card_index={card_index}")
+
+            hide_result = await page.evaluate("""
+                () => {
+                    const selectors = [
+                        '.s-top', '.S_top', '.s-topbar', '.topbar', '.gn_header',
+                        'header', '.header', '.Header',
+                        '.ProfileHeader', '.profile-header',
+                        '.ProfileHeader_new', '.profile-header_new',
+                        '[class*="ProfileHeader"]', '[class*="profile-head"]',
+                        '.wb-proj-header', '.wb-header',
+                        'nav', '.global-nav', '.gn_nav',
+                        '.main-top', '.top-bar',
+                    ];
+                    let hidden = 0;
+                    for (const sel of selectors) {
+                        try {
+                            document.querySelectorAll(sel).forEach(el => {
+                                el.style.setProperty('display', 'none', 'important');
+                                el.style.setProperty('visibility', 'hidden', 'important');
+                                el.style.setProperty('height', '0px', 'important');
+                                el.style.setProperty('overflow', 'hidden', 'important');
+                            });
+                            hidden++;
+                        } catch(e) {}
+                    }
+
+                    const allEls = document.querySelectorAll('*');
+                    let stickyHidden = 0;
+                    let profileHidden = 0;
+                    for (const el of allEls) {
+                        const style = window.getComputedStyle(el);
+                        if (style.position === 'fixed' || style.position === 'sticky') {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.y < 150 && rect.height > 20 && rect.height < 200) {
+                                el.style.setProperty('display', 'none', 'important');
+                                el.style.setProperty('visibility', 'hidden', 'important');
+                                stickyHidden++;
+                            }
+                        }
+
+                        const text = (el.innerText || '').trim();
+                        if ((text.includes('返回') && text.length < 30) ||
+                            (text.includes('关注') && text.includes('粉丝') && text.length < 200)) {
+                            el.style.setProperty('display', 'none', 'important');
+                            el.style.setProperty('visibility', 'hidden', 'important');
+                            el.style.setProperty('height', '0px', 'important');
+                            profileHidden++;
+                        }
+                    }
+
+                    return { selectorsHidden: hidden, stickyHidden: stickyHidden, profileHidden: profileHidden };
+                }
+            """)
+            self.logger.info(f"    🔍 [文章截图] 隐藏元素完成: {hide_result}")
+
+            total_items = await page.evaluate("""
+                () => document.querySelectorAll('.wbpro-scroller-item').length
+            """)
+            self.logger.info(f"    🔍 [文章截图] 页面共有 {total_items} 个 .wbpro-scroller-item 元素")
+
             await page.evaluate(f"""
                 () => {{
-                    let targetEl = null;
                     const items = document.querySelectorAll('.wbpro-scroller-item');
-                    if (items.length > {card_index}) targetEl = items[{card_index}];
-                    if (!targetEl) {{
-                        const cards = document.querySelectorAll('.card-wrap');
-                        if (cards.length > {card_index}) targetEl = cards[{card_index}];
-                    }}
-                    if (targetEl) targetEl.scrollIntoView({{ behavior: 'instant', block: 'start' }});
+                    if (items.length > {card_index}) items[{card_index}].scrollIntoView({{ behavior: 'instant', block: 'start' }});
                 }}
             """)
+            self.logger.info(f"    🔍 [文章截图] scrollIntoView(block='start') 完成，等待2秒渲染")
+            await asyncio.sleep(2)
+
+            await page.evaluate(f"""
+                () => {{
+                    const items = document.querySelectorAll('.wbpro-scroller-item');
+                    if (items.length <= {card_index}) return;
+                    const item = items[{card_index}];
+                    const header = item.querySelector('header');
+                    if (header) {{
+                        header.style.setProperty('display', 'flex', 'important');
+                        header.style.setProperty('visibility', 'visible', 'important');
+                        header.style.setProperty('opacity', '1', 'important');
+                        header.style.setProperty('min-height', '52px', 'important');
+                    }}
+                    const avatarDiv = item.querySelector('[class*="avatar"]');
+                    if (avatarDiv) {{
+                        avatarDiv.style.setProperty('display', 'inline-block', 'important');
+                        avatarDiv.style.setProperty('visibility', 'visible', 'important');
+                        avatarDiv.style.setProperty('width', '52px', 'important');
+                        avatarDiv.style.setProperty('height', '52px', 'important');
+                    }}
+                    const avatarImg = item.querySelector('[class*="avatar"] img');
+                    if (avatarImg) {{
+                        avatarImg.style.setProperty('display', 'inline', 'important');
+                        avatarImg.style.setProperty('visibility', 'visible', 'important');
+                        avatarImg.style.setProperty('width', '52px', 'important');
+                        avatarImg.style.setProperty('height', '52px', 'important');
+                    }}
+                }}
+            """)
+            self.logger.info(f"    🔍 [文章截图] 强制渲染 header/avatar CSS 完成，等待1秒")
             await asyncio.sleep(1)
 
-            card_box = await page.evaluate(f"""
-                () => {{
-                    let targetEl = null;
-                    const items = document.querySelectorAll('.wbpro-scroller-item');
-                    if (items.length > {card_index}) targetEl = items[{card_index}];
-                    if (!targetEl) {{
-                        const cards = document.querySelectorAll('.card-wrap');
-                        if (cards.length > {card_index}) targetEl = cards[{card_index}];
+            for wait_i in range(8):
+                avatar_ok = await page.evaluate(f"""
+                    () => {{
+                        const items = document.querySelectorAll('.wbpro-scroller-item');
+                        if (items.length <= {card_index}) return false;
+                        const item = items[{card_index}];
+                        const avatar = item.querySelector('[class*="avatar"] img');
+                        if (!avatar) return true;
+                        const rect = avatar.getBoundingClientRect();
+                        return rect.width > 5 && rect.height > 5;
                     }}
-                    if (!targetEl) return null;
-                    const rect = targetEl.getBoundingClientRect();
-                    return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                """)
+                if avatar_ok:
+                    self.logger.info(f"    ✅ [文章截图] 头像已渲染 (第{wait_i+1}次检查)")
+                    break
+                self.logger.debug(f"    ⏳ [文章截图] 头像未渲染，等待... (第{wait_i+1}次)")
+                await asyncio.sleep(1)
+            else:
+                self.logger.warning(f"    ⚠️ [文章截图] 头像8次检查后仍未渲染，继续截图")
+
+            screenshot_info = await page.evaluate(f"""
+                () => {{
+                    const items = document.querySelectorAll('.wbpro-scroller-item');
+                    if (items.length <= {card_index}) return null;
+                    const item = items[{card_index}];
+                    const rect = item.getBoundingClientRect();
+
+                    const articleEl = item.querySelector('article');
+                    const artRect = articleEl ? articleEl.getBoundingClientRect() : null;
+
+                    const avatar = item.querySelector('[class*="avatar"] img');
+                    const avatarRect = avatar ? avatar.getBoundingClientRect() : null;
+
+                    const header = item.querySelector('header');
+                    const headerRect = header ? header.getBoundingClientRect() : null;
+
+                    return {{
+                        item: {{ x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }},
+                        article: artRect ? {{ x: Math.round(artRect.x), y: Math.round(artRect.y), w: Math.round(artRect.width), h: Math.round(artRect.height) }} : null,
+                        avatar: avatarRect ? {{ x: Math.round(avatarRect.x), y: Math.round(avatarRect.y), w: Math.round(avatarRect.width), h: Math.round(avatarRect.height) }} : null,
+                        header: headerRect ? {{ x: Math.round(headerRect.x), y: Math.round(headerRect.y), w: Math.round(headerRect.width), h: Math.round(headerRect.height) }} : null,
+                    }};
                 }}
             """)
+            self.logger.info(f"    📐 [文章截图] 截图前状态: item={screenshot_info.get('item')}, article={screenshot_info.get('article')}")
 
-            if card_box and card_box.get('height', 0) > 50:
-                clip = {
-                    'x': max(0, card_box['x']),
-                    'y': max(0, card_box['y']) + 50,
-                    'width': card_box['width'],
-                    'height': min(card_box['height'], 3000) - 50,
-                }
-                await page.screenshot(path=screenshot_path, clip=clip)
-                return True
+            if not screenshot_info or not screenshot_info.get('item'):
+                self.logger.warning(f"    ❌ [文章截图] screenshot_info 为空，无法截图")
+                return False
 
-            try:
-                element_handle = await page.query_selector(f'.wbpro-scroller-item:nth-child({card_index + 1}), .card-wrap:nth-child({card_index + 1})')
-                if element_handle:
-                    await element_handle.screenshot(path=screenshot_path)
-                    return True
-            except Exception:
-                pass
+            target_rect = screenshot_info.get('article') or screenshot_info['item']
+            clip_x = max(0, int(target_rect['x']))
+            clip_y = max(0, int(target_rect['y']))
+            clip_w = int(target_rect['w'])
+            clip_h = min(int(target_rect['h']), 5000)
 
-            return False
+            self.logger.info(f"    📐 [文章截图] 使用 clip 方式: x={clip_x} y={clip_y} w={clip_w} h={clip_h}")
+
+            clip = {'x': clip_x, 'y': clip_y, 'width': clip_w, 'height': clip_h}
+            await page.screenshot(path=screenshot_path, clip=clip)
+            self.logger.info(f"    📸 [文章截图] page.screenshot(clip) 成功 → {screenshot_path}")
+            return True
+
         except Exception as e:
-            self.logger.debug(f"[AuthorMonitor] 截图失败: {e}")
+            self.logger.error(f"    ❌ [文章截图] 异常: {e}", exc_info=True)
             return False
 
     async def _get_post_comments(self, detail_url: str, author_id: str,
@@ -456,181 +679,157 @@ class AuthorMonitor:
     async def _screenshot_comments_from_detail_page(self, page, keyword: str,
                                                       article_index: int, safe_kw: str) -> list:
         comment_models = []
+        processed_indices = set()
 
         try:
-            filter_debug = await page.evaluate("""
-                () => {
-                    const allItems = document.querySelectorAll('.vue-recycle-scroller__item-view');
-                    const details = [];
-                    for (let i = 0; i < allItems.length; i++) {
-                        const el = allItems[i];
-                        const scrollerItem = el.querySelector('.wbpro-scroller-item');
-                        const d = {
-                            vueIndex: i,
-                            dataIndex: scrollerItem ? (parseInt(scrollerItem.getAttribute('data-index')) || 0) : -1,
-                            pass_dataIndex: false,
-                            pass_recommend: false,
-                            finalPass: false
-                        };
-                        d.pass_dataIndex = d.dataIndex > 0;
-                        const text = (el.innerText || '');
-                        d.pass_recommend = !text.includes('推荐') && !text.includes('荐读');
-                        d.finalPass = d.pass_dataIndex && d.pass_recommend;
-                        details.push(d);
-                    }
-                    return { totalVueItems: allItems.length, details: details };
-                }
-            """)
+            self.logger.info(f"    🔍 [评论截图] 开始渐进式扫描评论区 (最多{self.max_comments_per_article}条)")
 
-            comment_data_indices = []
-            for d in filter_debug.get('details', []):
-                if d.get('finalPass'):
-                    comment_data_indices.append(d.get('dataIndex'))
+            max_scroll_rounds = 30
+            no_new_count = 0
 
-            if not comment_data_indices:
-                self.logger.info(f"    未找到评论元素")
-                return comment_models
+            for scroll_round in range(max_scroll_rounds):
+                if len(processed_indices) >= self.max_comments_per_article:
+                    self.logger.info(f"    🔍 [评论截图] 已达到最大评论数 {self.max_comments_per_article}，停止滚动")
+                    break
 
-            self.logger.info(f"    找到 {len(comment_data_indices)} 条评论")
+                visible_comments = await page.evaluate("""
+                    () => {
+                        const vh = window.innerHeight;
+                        const results = [];
+                        const allItems = document.querySelectorAll('.vue-recycle-scroller__item-view');
+                        for (const item of allItems) {
+                            const scrollerItem = item.querySelector('.wbpro-scroller-item');
+                            if (!scrollerItem) continue;
+                            const di = parseInt(scrollerItem.getAttribute('data-index')) || 0;
+                            if (di <= 0) continue;
+                            const rect = item.getBoundingClientRect();
+                            const inViewport = rect.height > 10 && rect.top < vh && rect.bottom > 0;
+                            if (!inViewport) continue;
+                            const text = (item.innerText || '');
+                            if (text.includes('推荐') || text.includes('荐读')) continue;
 
-            data_indices_to_process = comment_data_indices[:self.max_comments_per_article]
+                            const data = {};
+                            data.data_index = di;
+                            data.rect = { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
 
-            for seq, target_data_index in enumerate(data_indices_to_process):
-                try:
-                    await page.evaluate(f"""
-                        () => {{
-                            const allItems = document.querySelectorAll('.vue-recycle-scroller__item-view .wbpro-scroller-item');
-                            for (const item of allItems) {{
-                                const di = parseInt(item.getAttribute('data-index')) || 0;
-                                if (di === {target_data_index}) {{
-                                    item.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-                                    break;
-                                }}
-                            }}
-                        }}
-                    """)
-                    await asyncio.sleep(1.5)
-
-                    comment_data = await page.evaluate(f"""
-                        () => {{
-                            const allItems = document.querySelectorAll('.vue-recycle-scroller__item-view');
-                            let el = null;
-                            for (const item of allItems) {{
-                                const scrollerItem = item.querySelector('.wbpro-scroller-item');
-                                const di = parseInt(scrollerItem?.getAttribute('data-index')) || 0;
-                                if (di === {target_data_index}) {{
-                                    el = item;
-                                    break;
-                                }}
-                            }}
-                            if (!el) return null;
-
-                            const data = {{}};
-                            const scrollerItem = el.querySelector('.wbpro-scroller-item');
-                            const target = scrollerItem || el;
-                            data.data_index = parseInt(scrollerItem?.getAttribute('data-index')) || 0;
-
-                            const fullText = target.innerText || '';
-                            const userLink = target.querySelector('a[href*="weibo.com/u/"], a[href*="weibo.com/n/"]');
+                            const userLink = item.querySelector('a[href*="weibo.com/u/"], a[href*="weibo.com/n/"]');
                             data.author_name = userLink ? userLink.innerText.trim() : '';
 
-                            const contentEl = target.querySelector('.WB_text, .txt, [class*="text"], [class*="content"]');
-                            if (contentEl) {{
-                                var text = contentEl.innerText.trim();
-                                var colonIdx = text.indexOf(':');
-                                if (colonIdx >= 0 && colonIdx < 30) {{
-                                    text = text.substring(colonIdx + 1).trim();
-                                }}
-                                data.content_text = text;
-                            }} else {{
-                                var lines = fullText.split('\\n').filter(function(l) {{ return l.trim(); }});
-                                if (lines.length >= 2) {{
-                                    for (var k = 0; k < lines.length; k++) {{
+                            const contentEl = scrollerItem.querySelector('.WB_text, .txt, [class*="text"], [class*="content"]');
+                            if (contentEl) {
+                                var t = contentEl.innerText.trim();
+                                var ci = t.indexOf(':');
+                                if (ci >= 0 && ci < 30) t = t.substring(ci + 1).trim();
+                                data.content_text = t;
+                            } else {
+                                var lines = text.split('\\n').filter(function(l) { return l.trim(); });
+                                if (lines.length >= 2) {
+                                    for (var k = 0; k < lines.length; k++) {
                                         var ci = lines[k].indexOf(':');
-                                        if (ci >= 0 && ci < 30) {{
+                                        if (ci >= 0 && ci < 30) {
                                             data.content_text = lines[k].substring(ci + 1).trim();
-                                            if (!data.author_name) {{
-                                                data.author_name = lines[k].substring(0, ci).trim();
-                                            }}
+                                            if (!data.author_name) data.author_name = lines[k].substring(0, ci).trim();
                                             break;
-                                        }}
-                                    }}
-                                    if (!data.content_text) {{
-                                        data.content_text = lines.slice(1).join(' ').substring(0, 500);
-                                    }}
-                                }} else {{
-                                    data.content_text = fullText.substring(0, 200);
-                                }}
-                            }}
+                                        }
+                                    }
+                                    if (!data.content_text) data.content_text = lines.slice(1).join(' ').substring(0, 500);
+                                } else {
+                                    data.content_text = text.substring(0, 200);
+                                }
+                            }
 
-                            const likeEl = target.querySelector('[class*="like"] em, [class*="like"] span, .count');
+                            const likeEl = scrollerItem.querySelector('[class*="like"] em, [class*="like"] span, .count');
                             data.like_count = likeEl ? parseInt(likeEl.innerText) || 0 : 0;
 
-                            const rect = el.getBoundingClientRect();
-                            data.visible = rect.height > 20 && rect.y > -rect.height && rect.y < window.innerHeight;
+                            results.push(data);
+                        }
+                        return results;
+                    }
+                """)
 
-                            return data;
-                        }}
-                    """)
-
-                    if not comment_data:
+                new_in_this_round = 0
+                for cd in (visible_comments or []):
+                    di = cd.get('data_index')
+                    if di in processed_indices:
                         continue
 
-                    author = comment_data.get('author_name', '')
-                    content = comment_data.get('content_text', '')
-                    is_visible = comment_data.get('visible', False)
+                    processed_indices.add(di)
+                    new_in_this_round += 1
 
-                    self.logger.info(f"    📋 评论[{seq}] data-index={target_data_index} author=\"{author}\" content=\"{content[:60]}\"")
+                    content = cd.get('content_text', '')
+                    author = cd.get('author_name', '')
+                    rect_info = cd.get('rect', {})
+
+                    self.logger.info(f"    📋 [评论截图] 第{scroll_round+1}轮发现 data-index={di} rect={rect_info} author=\"{author}\" content=\"{content[:60]}\"")
 
                     if not content.strip():
-                        self.logger.info(f"    ⏭ 评论[{seq}] 无文字内容，跳过")
+                        self.logger.info(f"    ⏭ [评论截图] data-index={di} 无文字内容，跳过")
                         continue
 
+                    seq = len(processed_indices) - 1
                     comment_screenshot_name = generate_filename(safe_kw, f'comment_{article_index}_{seq}', '.png')
                     comment_screenshot_path = str(self.screenshot_dir / 'comments' / comment_screenshot_name)
                     Path(comment_screenshot_path).parent.mkdir(parents=True, exist_ok=True)
 
                     screenshot_saved = False
+                    try:
+                        element_handle = await page.query_selector(f'.vue-recycle-scroller__item-view .wbpro-scroller-item[data-index="{di}"]')
+                        if element_handle:
+                            parent_handle = await element_handle.evaluate_handle('el => el.closest(".vue-recycle-scroller__item-view")')
+                            if parent_handle:
+                                parent_el = parent_handle.as_element()
+                                parent_box = await parent_el.bounding_box() if parent_el else None
+                                self.logger.info(f"    📐 [评论截图] data-index={di} parent bounding_box: {parent_box}")
 
-                    if is_visible:
-                        try:
-                            element_handle = await page.query_selector(f'.vue-recycle-scroller__item-view .wbpro-scroller-item[data-index="{target_data_index}"]')
-                            if element_handle:
-                                parent_handle = await element_handle.evaluate_handle('el => el.closest(".vue-recycle-scroller__item-view")')
-                                if parent_handle:
-                                    await parent_handle.screenshot(path=comment_screenshot_path)
-                                    screenshot_saved = True
-                                    self.logger.info(f"    📸 评论[{seq}] 截图已保存 (element.screenshot)")
-                        except Exception:
-                            pass
+                                if parent_box:
+                                    ph = parent_box['height']
+                                    if 10 < ph < 800:
+                                        self.logger.info(f"    📐 [评论截图] data-index={di} 高度检查通过: h={ph:.0f}，执行 element.screenshot")
+                                        await parent_el.screenshot(path=comment_screenshot_path)
+                                        screenshot_saved = True
+                                        self.logger.info(f"    📸 [评论截图] data-index={di} element.screenshot 成功 → {comment_screenshot_path}")
+                                    else:
+                                        self.logger.info(f"    ⏭ [评论截图] data-index={di} 高度检查未通过: h={ph:.0f} (需 10 < h < 800)")
+                                else:
+                                    self.logger.warning(f"    ❌ [评论截图] data-index={di} parent bounding_box 为空")
+                            else:
+                                self.logger.warning(f"    ❌ [评论截图] data-index={di} 未找到父元素")
+                        else:
+                            self.logger.warning(f"    ❌ [评论截图] data-index={di} 未找到 .wbpro-scroller-item")
+                    except Exception as e:
+                        self.logger.warning(f"    ❌ [评论截图] data-index={di} element.screenshot 异常: {e}")
 
                     if not screenshot_saved:
-                        try:
-                            await page.screenshot(path=comment_screenshot_path, full_page=False)
-                            screenshot_saved = True
-                        except Exception:
-                            pass
-
-                    if not screenshot_saved:
+                        self.logger.info(f"    ⏭ [评论截图] data-index={di} 截图未保存，跳过")
                         continue
 
                     comment = CommentModel(
                         article_url=page.url,
                         comment_id=f"comment_author_{keyword[:10]}_{article_index}_{seq}",
-                        content_text=comment_data.get('content_text', ''),
+                        content_text=content,
                         author_name=author,
-                        like_count=comment_data.get('like_count', 0),
+                        like_count=cd.get('like_count', 0),
                         screenshot_path=comment_screenshot_path,
                     )
                     comment_models.append(comment)
 
-                except Exception as e:
-                    self.logger.debug(f"    评论[{seq}]处理失败: {e}")
-                    continue
+                self.logger.info(f"    🔍 [评论截图] 第{scroll_round+1}轮完成: 新发现{new_in_this_round}条, 累计处理{len(processed_indices)}条, 截图{len(comment_models)}条")
+
+                if new_in_this_round == 0:
+                    no_new_count += 1
+                    if no_new_count >= 3:
+                        self.logger.info(f"    🔍 [评论截图] 连续{no_new_count}轮无新评论，停止滚动")
+                        break
+                else:
+                    no_new_count = 0
+
+                await page.mouse.wheel(0, 500)
+                await asyncio.sleep(1.5)
 
         except Exception as e:
-            self.logger.warning(f"[AuthorMonitor] 评论截图异常: {e}")
+            self.logger.error(f"    ❌ [评论截图] 整体异常: {e}", exc_info=True)
 
+        self.logger.info(f"    🔍 [评论截图] 最终结果: 扫描{len(processed_indices)}条, 截图{len(comment_models)}条")
         return comment_models
 
     async def _hide_navigation_bar(self, page):

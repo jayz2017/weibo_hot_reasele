@@ -162,7 +162,7 @@ class BrowserController(BaseSkill):
         try:
             self.logger.debug(f"[{self.name}] 正在访问: {url[:50]}...")
             
-            response = await page.goto(url, wait_until=wait_for, timeout=30000)
+            response = await page.goto(url, wait_until=wait_for, timeout=60000)
             
             if response and response.status == 200:
                 # 额外等待确保JS渲染完成

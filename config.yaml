@@ -3,8 +3,8 @@ app:
   version: 1.0.0
 
 paths:
-  screenshot_dir: "G:\\weibo_hot\\png"
-  log_dir: "G:\\weibo_hot\\log"
+  screenshot_dir: "./data/screenshots"
+  log_dir: "./data/logs"
   data_dir: "./data"
 
 crawler:
@@ -82,9 +82,9 @@ pipeline:
 
 mysql:
   enabled: true
-  host: "localhost"
+  host: "127.0.0.1"
   port: 3306
-  user: "root"
-  password: "Jockson2021@@"
+  user: "zb_manager_u"
+  password: "zbManager123!"
   database: "sport_zhiboba_text"
   charset: "utf8mb4"
