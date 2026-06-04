@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime
 from typing import List, Dict, Any
 from core.base import BaseSkill
 from core.exceptions import DataFetchError, ParseError
@@ -118,6 +119,18 @@ class HotSearchCrawler(BaseSkill):
         """
         required_fields = ['word', 'num', 'rank']
         return all(field in item for field in required_fields)
+    
+    def _dict_to_model(self, item: dict) -> HotSearchModel:
+        return HotSearchModel(
+            rank=item.get('rank', 0),
+            word=item.get('word', ''),
+            num=item.get('num', 0),
+            icon=item.get('icon', ''),
+            category=item.get('category', ''),
+            word_scheme=item.get('word_scheme', ''),
+            raw_data=item,
+            fetched_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        )
     
     def close(self):
         """关闭HTTP客户端"""

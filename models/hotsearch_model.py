@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 @dataclass
@@ -16,6 +16,9 @@ class HotSearchModel:
     topic_flag: int = 0           # 话题标志
     word_scheme: str = ""         # 话题方案（带#号）
     realpos: int = 0              # 实际位置
+    category: str = ""            # 分类
+    raw_data: Optional[Dict[str, Any]] = field(default=None)  # 原始数据
+    fetched_at: str = ""          # 采集时间
     
     def to_dict(self) -> dict:
         return {
@@ -29,7 +32,10 @@ class HotSearchModel:
             'label_name': self.label_name,
             'topic_flag': self.topic_flag,
             'word_scheme': self.word_scheme,
-            'realpos': self.realpos
+            'realpos': self.realpos,
+            'category': self.category,
+            'raw_data': self.raw_data,
+            'fetched_at': self.fetched_at
         }
     
     @classmethod
@@ -45,5 +51,8 @@ class HotSearchModel:
             label_name=data.get('label_name', ''),
             topic_flag=data.get('topic_flag', 0),
             word_scheme=data.get('word_scheme', ''),
-            realpos=data.get('realpos', 0)
+            realpos=data.get('realpos', 0),
+            category=data.get('category', ''),
+            raw_data=data.get('raw_data', None),
+            fetched_at=data.get('fetched_at', '')
         )

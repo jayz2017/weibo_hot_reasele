@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from contextlib import contextmanager
+from dbutils.pooled_db import PooledDB
 
 
 class MySQLManager:
@@ -14,21 +15,30 @@ class MySQLManager:
         self.password = config.get('password', '')
         self.database = config.get('database', 'sport_zhiboba_text')
         self.charset = config.get('charset', 'utf8mb4')
-        self._connection = None
+        self._pool = None
+        self._init_pool()
         self._ensure_tables()
 
-    @contextmanager
-    def get_connection(self):
-        conn = pymysql.connect(
+    def _init_pool(self):
+        self._pool = PooledDB(
+            creator=pymysql,
+            mincached=2,
+            maxcached=5,
+            maxconnections=10,
+            blocking=True,
             host=self.host,
             port=self.port,
             user=self.user,
             password=self.password,
             database=self.database,
             charset=self.charset,
-            autocommit=False,
             cursorclass=pymysql.cursors.DictCursor
         )
+        self.logger.info("[MySQL] 连接池初始化完成 (min=2, max=5, max_conn=10)")
+
+    @contextmanager
+    def get_connection(self):
+        conn = self._pool.connection()
         try:
             yield conn
         except Exception as e:
@@ -76,8 +86,26 @@ class MySQLManager:
                         INDEX idx_article_url (article_url(255))
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS zb8_match_comment (
+                        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                        match_url VARCHAR(500) DEFAULT '',
+                        match_id VARCHAR(50) DEFAULT '',
+                        match_title VARCHAR(500) DEFAULT '',
+                        comment_id VARCHAR(200) DEFAULT '',
+                        author_name VARCHAR(200) DEFAULT '',
+                        content_text TEXT,
+                        like_count INT DEFAULT 0,
+                        reply_count INT DEFAULT 0,
+                        publish_time VARCHAR(50) DEFAULT '',
+                        screenshot_path VARCHAR(500) DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_match_comment (match_url(255), comment_id(100)),
+                        INDEX idx_match_id (match_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """)
                 conn.commit()
-                self.logger.info("[MySQL] 数据表初始化完成 (wb_article, wb_comment)")
+                self.logger.info("[MySQL] 数据表初始化完成 (wb_article, wb_comment, zb8_match_comment)")
         except Exception as e:
             self.logger.error(f"[MySQL] 建表失败: {e}")
             raise
@@ -209,16 +237,228 @@ class MySQLManager:
             cursor.execute("SELECT * FROM wb_article WHERE url = %s", (url,))
             return cursor.fetchone()
 
-    def get_comments_by_article_id(self, article_id: int) -> List[Dict]:
+    def get_comments_by_article_id(self, article_id: int, limit: int = 50) -> List[Dict]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM wb_comment WHERE article_id = %s ORDER BY id", (article_id,))
+            cursor.execute("SELECT * FROM wb_comment WHERE article_id = %s ORDER BY id LIMIT %s",
+                           (article_id, limit))
             return cursor.fetchall()
 
+    def save_zhibo8_comment(self, comment_data: Dict[str, Any]) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            match_url = comment_data.get('match_url', '')
+            comment_id = comment_data.get('comment_id', '')
+            existing = None
+            if match_url and comment_id:
+                cursor.execute(
+                    "SELECT id FROM zb8_match_comment WHERE match_url = %s AND comment_id = %s",
+                    (match_url, comment_id)
+                )
+                existing = cursor.fetchone()
+
+            if existing:
+                db_id = existing['id']
+                cursor.execute("""
+                    UPDATE zb8_match_comment SET
+                        author_name=%s, content_text=%s, like_count=%s,
+                        reply_count=%s, publish_time=%s, screenshot_path=%s
+                    WHERE id=%s
+                """, (
+                    comment_data.get('author_name', ''),
+                    comment_data.get('content_text', ''),
+                    comment_data.get('like_count', 0),
+                    comment_data.get('reply_count', 0),
+                    comment_data.get('publish_time', ''),
+                    comment_data.get('screenshot_path', ''),
+                    db_id
+                ))
+                self.logger.info(f"[MySQL] 直播吧评论已更新 id={db_id}")
+            else:
+                cursor.execute("""
+                    INSERT INTO zb8_match_comment (match_url, match_id, match_title,
+                        comment_id, author_name, content_text, like_count, reply_count,
+                        publish_time, screenshot_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    comment_data.get('match_url', ''),
+                    comment_data.get('match_id', ''),
+                    comment_data.get('match_title', ''),
+                    comment_data.get('comment_id', ''),
+                    comment_data.get('author_name', ''),
+                    comment_data.get('content_text', ''),
+                    comment_data.get('like_count', 0),
+                    comment_data.get('reply_count', 0),
+                    comment_data.get('publish_time', ''),
+                    comment_data.get('screenshot_path', '')
+                ))
+                db_id = cursor.lastrowid
+                self.logger.info(f"[MySQL] 直播吧评论已插入 id={db_id}")
+
+            conn.commit()
+            return db_id
+
+    def save_zhibo8_comments_batch(self, comments_data: List[Dict[str, Any]]) -> int:
+        if not comments_data:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            first_comment = comments_data[0]
+            match_url = first_comment.get('match_url', '')
+            if match_url:
+                cursor.execute(
+                    "SELECT comment_id FROM zb8_match_comment WHERE match_url = %s",
+                    (match_url,)
+                )
+                existing_ids = {row['comment_id'] for row in cursor.fetchall()}
+            else:
+                existing_ids = set()
+
+            rows = []
+            skipped = 0
+            for cd in comments_data:
+                cid = cd.get('comment_id', '')
+                if cid and cid in existing_ids:
+                    skipped += 1
+                    continue
+                rows.append((
+                    cd.get('match_url', ''),
+                    cd.get('match_id', ''),
+                    cd.get('match_title', ''),
+                    cd.get('comment_id', ''),
+                    cd.get('author_name', ''),
+                    cd.get('content_text', ''),
+                    cd.get('like_count', 0),
+                    cd.get('reply_count', 0),
+                    cd.get('publish_time', ''),
+                    cd.get('screenshot_path', '')
+                ))
+                existing_ids.add(cid)
+
+            if not rows:
+                self.logger.info(f"[MySQL] 直播吧评论全部重复，跳过 (skipped={skipped})")
+                return 0
+
+            cursor.executemany("""
+                INSERT INTO zb8_match_comment (match_url, match_id, match_title,
+                    comment_id, author_name, content_text, like_count, reply_count,
+                    publish_time, screenshot_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, rows)
+            conn.commit()
+            count = cursor.rowcount
+            self.logger.info(f"[MySQL] 批量插入直播吧评论 {count} 条 (跳过重复{skipped}条)")
+            return count
+
+    def get_zhibo8_comments_by_match(self, match_url: str) -> List[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM zb8_match_comment WHERE match_url = %s ORDER BY like_count DESC, id",
+                (match_url,)
+            )
+            return cursor.fetchall()
+
+    def get_articles(self, keyword: str = None, author_name: str = None,
+                     page: int = 1, page_size: int = 20) -> tuple:
+        offset = (page - 1) * page_size
+        conditions = []
+        params = []
+        if keyword:
+            conditions.append("keyword LIKE %s")
+            params.append(f"%{keyword}%")
+        if author_name:
+            conditions.append("author_name LIKE %s")
+            params.append(f"%{author_name}%")
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) as total FROM wb_article {where_clause}", params or ())
+            total = cursor.fetchone()['total']
+            cursor.execute(
+                f"SELECT * FROM wb_article {where_clause} ORDER BY id DESC LIMIT %s OFFSET %s",
+                (params or []) + [page_size, offset]
+            )
+            rows = cursor.fetchall()
+        return total, rows
+
+    def get_article_by_id(self, article_id: int) -> Dict:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM wb_article WHERE id = %s", (article_id,))
+            return cursor.fetchone()
+
+    def get_comments(self, article_url: str = None, author_name: str = None,
+                     page: int = 1, page_size: int = 20) -> tuple:
+        offset = (page - 1) * page_size
+        conditions = []
+        params = []
+        if article_url:
+            conditions.append("article_url LIKE %s")
+            params.append(f"%{article_url}%")
+        if author_name:
+            conditions.append("author_name LIKE %s")
+            params.append(f"%{author_name}%")
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) as total FROM wb_comment {where_clause}", params or ())
+            total = cursor.fetchone()['total']
+            cursor.execute(
+                f"SELECT * FROM wb_comment {where_clause} ORDER BY id DESC LIMIT %s OFFSET %s",
+                (params or []) + [page_size, offset]
+            )
+            rows = cursor.fetchall()
+        return total, rows
+
+    def get_zhibo8_comments(self, match_url: str = None, match_id: str = None,
+                            min_likes: int = 0, page: int = 1, page_size: int = 30) -> tuple:
+        offset = (page - 1) * page_size
+        conditions = ["like_count >= %s"]
+        params = [min_likes]
+        if match_url:
+            conditions.append("match_url LIKE %s")
+            params.append(f"%{match_url}%")
+        if match_id:
+            conditions.append("match_id = %s")
+            params.append(match_id)
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) as total FROM zb8_match_comment {where_clause}", params)
+            total = cursor.fetchone()['total']
+            cursor.execute(
+                f"SELECT * FROM zb8_match_comment {where_clause} ORDER BY like_count DESC LIMIT %s OFFSET %s",
+                params + [page_size, offset]
+            )
+            rows = cursor.fetchall()
+        return total, rows
+
+    def get_zhibo8_matches(self, page: int = 1, page_size: int = 20) -> tuple:
+        offset = (page - 1) * page_size
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""SELECT match_url, match_title, match_id,
+                              COUNT(*) as comment_count,
+                              MAX(like_count) as max_likes,
+                              SUM(like_count) as total_likes,
+                              MAX(created_at) as latest_comment
+                              FROM zb8_match_comment
+                              GROUP BY match_url, match_title, match_id
+                              ORDER BY latest_comment DESC
+                              LIMIT %s OFFSET %s""", (page_size, offset))
+            rows = cursor.fetchall()
+            cursor.execute("SELECT COUNT(DISTINCT match_url) as total FROM zb8_match_comment")
+            total = cursor.fetchone()['total']
+        return total, rows
+
     def close(self):
-        if self._connection:
+        if self._pool:
             try:
-                self._connection.close()
+                self._pool.close()
             except Exception:
                 pass
-            self._connection = None
+            self._pool = None

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from core.base import BaseSkill
@@ -57,7 +58,9 @@ class BrowserController(BaseSkill):
                 args=[
                     '--disable-blink-features=AutomationControlled',
                     '--no-sandbox',
-                    '--disable-dev-shm-usage'
+                    '--disable-dev-shm-usage',
+                    '--force-color-profile=srgb',
+                    '--blink-settings=forceDarkMode=0',
                 ]
             )
             
@@ -65,18 +68,21 @@ class BrowserController(BaseSkill):
                 viewport={'width': self.viewport_width, 'height': self.viewport_height},
                 user_agent=self.user_agent,
                 locale='zh-CN',
-                timezone_id='Asia/Shanghai'
+                timezone_id='Asia/Shanghai',
+                color_scheme='light'
             )
             
             # 加载Cookie（如果配置了）
             cookie_str = self.config.get('browser', {}).get('cookie', '')
+            if not cookie_str:
+                cookie_str = os.environ.get('WEIBO_COOKIE', '')
             if cookie_str:
                 await self._load_cookies(cookie_str)
                 self.logger.info(f"[{self.name}] 已加载Cookie配置")
             else:
                 self.logger.warning(f"[{self.name}] 未配置Cookie，微博搜索页可能需要登录")
             
-            # 反检测脚本
+            # 反检测脚本 + 强制浅色主题
             await self.context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
@@ -92,6 +98,15 @@ class BrowserController(BaseSkill):
                         Promise.resolve({ state: Notification.permission }) :
                         originalQuery(parameters)
                 );
+
+                // 强制浅色主题：拦截 matchMedia 查询
+                const originalMatchMedia = window.matchMedia;
+                window.matchMedia = function(query) {
+                    if (query && query.includes('prefers-color-scheme')) {
+                        return { matches: false, media: query, addEventListener: () => {}, removeEventListener: () => {} };
+                    }
+                    return originalMatchMedia.call(this, query);
+                };
             """)
             
             self.logger.info(f"[{self.name}] 浏览器启动成功")
@@ -276,15 +291,10 @@ class BrowserController(BaseSkill):
         except Exception as e:
             self.logger.warning(f"[{self.name}] 关闭浏览器时出错: {e}")
     
-    def execute(self, *args, **kwargs):
-        """
-        同步入口（内部调用异步方法）
-        
-        注意：此方法主要用于兼容BaseSkill接口
-        实际使用时应直接调用异步方法
-        """
-        self.logger.warning(f"[{self.name}] BrowserController主要使用异步方法，请使用await controller.start_browser()")
-        return None
+    async def execute(self, *args, **kwargs) -> 'BrowserController':
+        """执行技能：返回已初始化的浏览器实例"""
+        self.logger.info(f"[{self.name}] 浏览器实例就绪")
+        return self
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -294,3 +304,36 @@ class BrowserController(BaseSkill):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器退出"""
         await self.close_browser()
+
+    async def create_standalone_context(self):
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=self.headless,
+            args=['--no-sandbox', '--disable-dev-shm-usage']
+        )
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
+            locale='zh-CN',
+            timezone_id='Asia/Shanghai',
+            color_scheme='light'
+        )
+
+        class _StandaloneBrowser:
+            def __init__(self, b, c):
+                self._browser = b
+                self.context = c
+            async def new_page(self):
+                return await self.context.new_page()
+            async def close_page(self, page):
+                await page.close()
+            async def close(self):
+                await self.context.close()
+                await self._browser.close()
+            def __getattr__(self, name):
+                return getattr(self._browser, name)
+
+        wrapper = _StandaloneBrowser(browser, context)
+        return wrapper, pw

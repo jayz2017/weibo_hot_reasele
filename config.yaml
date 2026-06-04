@@ -42,7 +42,7 @@ browser:
   screenshot_type: png
   wait_timeout: 15000
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  cookie: "SCF=ApfrSGyMKoNeLxNnMmeRF9pjBylFlutXxYlMkoT5N4vFmn51x-D1dtmyEWzgX4u4-GrpBCvrtcUB5N38y3MD3nE.; SUB=_2A25HFVh4DeRhGeNL7FUZ8S_OyzWIHXVka9WwrDV8PUNbmtAYLVDykW9NSPGimVtfWw3G8LCqqebKcoue_pQSsStI; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9WhFuak_ui-GHnov__6UcYhk5NHD95QfSKMN1h2peo54Ws4Dqcj_i--Ni-8si-88i--NiK.7iKn0i--fiKn4iKy2i--NiKL8i-iFi--fiK.7iKLF; ALF=02_1782101288; SINAGLOBAL=6597216078207.407.1779509288468; ULV=1779509288470:1:1:1:6597216078207.407.1779509288468:; XSRF-TOKEN=rvKN9eB4XAtPdmD9bLg2wmhg; WBPSESS=KmkcCC-NOyl7Vstvd_nzSEI3U7Zngq67yZH8IcUkrIu0jj2OrR6vx3HZbt_5I6pfbeOBwlxFxgNk8IFaw3yCcHkerLImsge1ghUpXfAAa1lXnBXhD4EtYF6N6qNohX3o2esB02mxaCVT00I35Jmgpw=="
+  cookie: ""
 
 storage:
   base_dir: "./data"
@@ -88,3 +88,10 @@ mysql:
   password: "zbManager123!"
   database: "sport_zhiboba_text"
   charset: "utf8mb4"
+
+zhibo8:
+  enabled: true
+  base_url: "https://www.zhibo8.com"
+  max_comments: 30
+  wait_for_comments: 8000
+  screenshot_dir: "./data/screenshots/zhibo8_comments"

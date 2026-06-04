@@ -8,14 +8,15 @@ from models.article_model import ArticleModel
 from models.comment_model import CommentModel
 from utils.mysql_manager import MySQLManager
 from utils.file_utils import generate_filename, clean_filename
+from core.base import BaseSkill
 
 
-class AuthorMonitor:
-    def __init__(self, config: Dict[str, Any], browser_controller, mysql: Optional[MySQLManager], logger: logging.Logger):
-        self.config = config
-        self.browser = browser_controller
+class AuthorMonitor(BaseSkill):
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger, *, browser=None, mysql: Optional[MySQLManager] = None, image_handler=None):
+        super().__init__(config, logger)
+        self.browser = browser
         self.mysql = mysql
-        self.logger = logger
+        self.image_handler = image_handler
 
         paths_config = config.get('paths', {})
         self.screenshot_dir = Path(paths_config.get('screenshot_dir', './data/screenshots'))
@@ -146,8 +147,7 @@ class AuthorMonitor:
                 self.logger.warning(f"[AuthorMonitor] 被重定向到登录页，需要Cookie")
                 return articles, comments
 
-            await self._hide_navigation_bar(page)
-
+            # 获取作者名称
             page_author_name = await page.evaluate("""
                 () => {
                     const nameEl = document.querySelector('.ProfileHeader_name, .user_name, h1[class*="name"], [class*="UserName"], [class*="username"]');
@@ -157,16 +157,12 @@ class AuthorMonitor:
                     const titleEl = document.querySelector('title');
                     if (titleEl) {
                         const text = titleEl.innerText || '';
-                        if (text.includes('的微博')) {
-                            return text.split('的微博')[0].trim();
-                        }
+                        if (text.includes('的微博')) return text.split('的微博')[0].trim();
                         if (text.includes('-')) {
                             const parts = text.split('-');
                             for (let i = 0; i < parts.length; i++) {
                                 const p = parts[i].trim();
-                                if (p && p !== '微博' && p !== '随时随地发现新鲜事' && !p.includes('weibo')) {
-                                    return p;
-                                }
+                                if (p && p !== '微博' && p !== '随时随地发现新鲜事' && !p.includes('weibo')) return p;
                             }
                         }
                     }
@@ -179,13 +175,14 @@ class AuthorMonitor:
 
             existing_urls = self._get_existing_article_urls(author_id)
 
+            # 在主页获取最近微博列表（仅提取信息，不截图）
             recent_posts = await self._get_recent_posts(page, author_name)
 
             if not recent_posts:
                 self.logger.info(f"[AuthorMonitor] 作者 {author_name} 最近{self.monitor_minutes}分钟内无更新")
                 return articles, comments
 
-            self.logger.info(f"[AuthorMonitor] 发现 {len(recent_posts)} 条最近更新")
+            self.logger.info(f"[AuthorMonitor] 发现 {len(recent_posts)} 条最近更新，逐条进入详情页截图")
 
             safe_kw = clean_filename(f"author_{author_id}")
 
@@ -195,45 +192,46 @@ class AuthorMonitor:
                     detail_url = post_info.get('detail_url', '')
                     publish_time = post_info.get('publish_time', '')
 
-                    if detail_url and detail_url in existing_urls:
+                    if not detail_url or detail_url.startswith('sinaweibo://'):
+                        self.logger.info(f"  ⏭ [{i+1}] 无有效详情URL，跳过")
+                        continue
+
+                    if detail_url in existing_urls:
                         self.logger.info(f"  ⏭ [{i+1}] 文章已存在，跳过: {detail_url[:60]}")
                         continue
 
-                    self.logger.info(f"  📄 [{i+1}] {content_text[:50]}...")
+                    self.logger.info(f"  📄 [{i+1}] 进入详情页: {detail_url[:80]}")
 
+                    # 进入详情页，截图文章内容 + 评论
                     article_screenshot_name = generate_filename(safe_kw, f'article_{i}', '.png')
                     article_screenshot_path = str(self.screenshot_dir / 'articles' / article_screenshot_name)
                     Path(article_screenshot_path).parent.mkdir(parents=True, exist_ok=True)
 
-                    card_index = post_info.get('index', i)
-                    screenshot_saved = await self._screenshot_post_card(page, card_index, article_screenshot_path)
-
-                    if not screenshot_saved:
-                        await self.browser.take_screenshot(page, article_screenshot_path, full_page=False)
-
-                    article = ArticleModel(
-                        keyword=f"author_monitor_{author_id}",
-                        title=content_text[:100],
-                        author_name=author_name,
-                        author_id=author_id,
-                        content_text=content_text[:2000],
-                        publish_time=publish_time,
-                        repost_count=post_info.get('repost_count', 0),
-                        comment_count=post_info.get('comment_count', 0),
-                        like_count=post_info.get('like_count', 0),
-                        url=detail_url,
-                        screenshot_path=article_screenshot_path,
+                    article_data, post_comments = await self._process_detail_page(
+                        detail_url, author_id, author_name, i, safe_kw,
+                        article_screenshot_path
                     )
-                    articles.append(article)
-                    self.logger.info(f"  ✅ 第{i+1}条微博文章截图完成")
 
-                    if detail_url and 'weibo.com/' in detail_url and not detail_url.startswith('sinaweibo://'):
-                        post_comments = await self._get_post_comments(
-                            detail_url, author_id, i, safe_kw
+                    if article_data:
+                        article = ArticleModel(
+                            keyword=f"author_monitor_{author_id}",
+                            title=content_text[:100],
+                            author_name=author_name,
+                            author_id=author_id,
+                            content_text=article_data.get('content_text', content_text)[:2000],
+                            publish_time=publish_time,
+                            repost_count=post_info.get('repost_count', 0),
+                            comment_count=post_info.get('comment_count', 0),
+                            like_count=post_info.get('like_count', 0),
+                            url=detail_url,
+                            screenshot_path=article_screenshot_path,
                         )
+                        articles.append(article)
+                        self.logger.info(f"  ✅ 第{i+1}条微博详情页截图完成")
+
+                    if post_comments:
                         comments.extend(post_comments)
-                        if post_comments:
-                            self.logger.info(f"  ✅ 获取到 {len(post_comments)} 条评论")
+                        self.logger.info(f"  ✅ 获取到 {len(post_comments)} 条评论")
 
                 except Exception as e:
                     self.logger.warning(f"  第{i+1}条微博处理失败: {e}")
@@ -243,10 +241,364 @@ class AuthorMonitor:
             self.logger.error(f"[AuthorMonitor] 监控作者 {author_id} 异常: {e}")
         finally:
             if page:
-                await self._restore_navigation_bar(page)
                 await self.browser.close_page(page)
 
         return articles, comments
+
+    async def _process_detail_page(self, detail_url: str, author_id: str,
+                                    author_name: str, article_index: int,
+                                    safe_kw: str, article_screenshot_path: str) -> tuple:
+        """进入微博详情页，截图文章内容 + 获取评论截图"""
+        article_data = None
+        comment_models = []
+        detail_page = None
+
+        try:
+            # 处理特殊URL格式
+            if 'app.weibo.com/t/feed/' in detail_url:
+                feed_id = detail_url.split('/feed/')[-1].split('?')[0].split('#')[0]
+                if feed_id:
+                    detail_url = f"https://weibo.com/detail/{feed_id}"
+
+            detail_page = await self.browser.new_page()
+            nav_success = await self.browser.navigate_to(detail_page, detail_url, wait_for='domcontentloaded')
+
+            if not nav_success:
+                self.logger.warning(f"    详情页访问失败: {detail_url[:60]}")
+                return article_data, comment_models
+
+            await asyncio.sleep(5)
+
+            # 隐藏导航栏
+            await self.image_handler._hide_navigation_bar(detail_page)
+            light_stats = await self._prepare_light_screenshot_surface(detail_page)
+            self.logger.info(f"    [light-screenshot] initial DOM cleanup: {light_stats}")
+
+            # 等待文章内容加载
+            for wait_i in range(10):
+                content_loaded = await detail_page.evaluate("""
+                    () => {
+                        // 详情页的文章内容区域
+                        const detailContent = document.querySelector('.detail-content, .weibo-detail, [class*="detail"]');
+                        if (detailContent) return true;
+                        // 或者有 vue-recycle-scroller（评论列表）
+                        const scroller = document.querySelector('.vue-recycle-scroller');
+                        if (scroller) return true;
+                        // 或者有文章主体
+                        const article = document.querySelector('article');
+                        if (article) return true;
+                        return false;
+                    }
+                """)
+                if content_loaded:
+                    break
+                await asyncio.sleep(1)
+
+            # 滚动到页面顶部，确保文章内容可见
+            await detail_page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(2)
+
+            # 强制加载所有懒加载图片
+            await detail_page.evaluate("""
+                () => {
+                    document.querySelectorAll('img').forEach(img => {
+                        img.setAttribute('loading', 'eager');
+                        img.setAttribute('decoding', 'auto');
+                        const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-original');
+                        if (dataSrc && !img.src) img.src = dataSrc;
+                    });
+                }
+            """)
+            await asyncio.sleep(2)
+
+            # 提取文章内容文本
+            article_content = await detail_page.evaluate("""
+                () => {
+                    const selectors = [
+                        '.detail-content .txt', '.detail-content .content',
+                        '.weibo-detail .txt', '.weibo-detail .content',
+                        'article .txt', 'article .content',
+                        'article [class*="text"]', 'article [class*="content"]',
+                        '.WB_text', '.txt[node-type="feed_list_content"]',
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText.trim().length > 10) return el.innerText.trim();
+                    }
+                    // fallback: 取 article 内所有文本
+                    const article = document.querySelector('article');
+                    if (article) return article.innerText.trim().substring(0, 2000);
+                    return '';
+                }
+            """)
+
+            # 截图文章内容区域
+            screenshot_saved = await self._screenshot_detail_article(detail_page, article_screenshot_path)
+
+            if not screenshot_saved:
+                # fallback: 截取整个页面可见区域
+                await detail_page.screenshot(path=article_screenshot_path)
+                self.logger.info(f"    📸 [文章截图] fallback: 整页截图 → {article_screenshot_path}")
+
+            article_data = {'content_text': article_content or ''}
+
+            # 获取评论截图
+            comment_models = await self._screenshot_comments_from_detail_page(
+                detail_page, f"author_{author_id}", article_index, safe_kw
+            )
+
+        except Exception as e:
+            self.logger.warning(f"    详情页处理失败: {e}")
+        finally:
+            if detail_page:
+                await self.image_handler._restore_navigation_bar(detail_page)
+                await self.browser.close_page(detail_page)
+
+        return article_data, comment_models
+
+    async def _prepare_light_screenshot_surface(self, page, target_selector: str = '') -> Dict[str, Any]:
+        """Force white screenshot backgrounds while preserving the page's foreground styles."""
+        try:
+            return await page.evaluate("""
+                (targetSelector) => {
+                    const stats = {
+                        targetFound: false,
+                        backgroundElements: 0,
+                        filtersCleared: 0,
+                        hiddenOverlays: 0
+                    };
+
+                    const styleId = 'codex-force-light-screenshot-style';
+                    let style = document.getElementById(styleId);
+                    if (!style) {
+                        style = document.createElement('style');
+                        style.id = styleId;
+                        document.head.appendChild(style);
+                    }
+                    style.textContent = `
+                        html, body {
+                            background: #ffffff !important;
+                            color-scheme: light !important;
+                        }
+                        html::before, html::after, body::before, body::after {
+                            content: none !important;
+                            display: none !important;
+                            background: transparent !important;
+                        }
+                        .vue-recycle-scroller,
+                        .vue-recycle-scroller__item-view,
+                        .wbpro-scroller-item,
+                        article,
+                        main,
+                        .detail-content,
+                        .weibo-detail {
+                            background: #ffffff !important;
+                            background-color: #ffffff !important;
+                            background-image: none !important;
+                        }
+                    `;
+
+                    function parseColor(value) {
+                        if (!value || value === 'transparent') return null;
+                        const match = value.match(/rgba?\\(([^)]+)\\)/);
+                        if (!match) return null;
+                        const parts = match[1].split(',').map(p => p.trim());
+                        if (parts.length < 3) return null;
+                        return {
+                            r: Number.parseFloat(parts[0]),
+                            g: Number.parseFloat(parts[1]),
+                            b: Number.parseFloat(parts[2]),
+                            a: parts.length >= 4 ? Number.parseFloat(parts[3]) : 1
+                        };
+                    }
+
+                    function isDark(color) {
+                        return color && color.a > 0.05 && (color.r + color.g + color.b) < 260;
+                    }
+
+                    function hasVisualEffect(value) {
+                        return Boolean(value && value !== 'none');
+                    }
+
+                    function forceLight(el) {
+                        if (!el || !el.style) return;
+                        const cs = window.getComputedStyle(el);
+                        const bg = parseColor(cs.backgroundColor);
+
+                        if (el === document.documentElement || el === document.body || isDark(bg) || (bg && bg.a > 0 && bg.a < 1)) {
+                            el.style.setProperty('background-color', '#ffffff', 'important');
+                            el.style.setProperty('background-image', 'none', 'important');
+                        }
+                        stats.backgroundElements += 1;
+                    }
+
+                    const containerSelector = '.vue-recycle-scroller, .vue-recycle-scroller__item-view, .wbpro-scroller-item, article, main, .detail-content, .weibo-detail';
+                    const contentRoot = targetSelector
+                        ? document.querySelector(targetSelector)
+                        : (document.querySelector('.vue-recycle-scroller') || document.querySelector('article') || document.body);
+                    stats.targetFound = Boolean(contentRoot);
+
+                    const targets = new Set([document.documentElement, document.body]);
+                    if (contentRoot) {
+                        targets.add(contentRoot);
+                        contentRoot.querySelectorAll(containerSelector).forEach(el => targets.add(el));
+                    } else {
+                        document.querySelectorAll(containerSelector).forEach(el => targets.add(el));
+                    }
+                    targets.forEach(forceLight);
+
+                    const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+                    const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+                    const contentSelector = '.vue-recycle-scroller, .vue-recycle-scroller__item-view, .wbpro-scroller-item, article, main, .detail-content, .weibo-detail';
+                    document.querySelectorAll('*').forEach(el => {
+                        const cs = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        if (!rect.width || !rect.height || !vw || !vh) return;
+
+                        const areaRatio = (rect.width * rect.height) / (vw * vh);
+                        const position = cs.position;
+                        const bg = parseColor(cs.backgroundColor);
+                        const name = `${el.id || ''} ${el.className || ''}`.toLowerCase();
+                        const likelyOverlayName = /mask|overlay|modal|dialog|popup|shade|layer|dark|passport|login/.test(name);
+                        const hasDarkPaint = isDark(bg) || (bg && bg.a > 0.1 && bg.a < 1);
+                        const hasBackdrop = hasVisualEffect(cs.backdropFilter) || hasVisualEffect(cs.webkitBackdropFilter);
+                        const hasFilter = hasVisualEffect(cs.filter);
+                        const coversScreen = areaRatio > 0.35 && rect.width > vw * 0.65 && rect.height > vh * 0.35;
+                        const isFloating = position === 'fixed' || position === 'sticky' || position === 'absolute';
+                        const isContent = Boolean(el.closest(contentSelector));
+
+                        if (!isContent && isFloating && coversScreen && (likelyOverlayName || hasDarkPaint || hasBackdrop || hasFilter)) {
+                            el.setAttribute('data-wb-hidden', '1');
+                            el.style.setProperty('display', 'none', 'important');
+                            el.style.setProperty('visibility', 'hidden', 'important');
+                            stats.hiddenOverlays += 1;
+                        }
+                    });
+
+                    return stats;
+                }
+            """, target_selector or '')
+        except Exception as e:
+            self.logger.warning(f"    [light-screenshot] DOM cleanup failed: {e}")
+            return {"targetFound": False, "backgroundElements": 0, "filtersCleared": 0, "hiddenOverlays": 0, "error": str(e)}
+
+    async def _screenshot_detail_article(self, page, screenshot_path: str) -> bool:
+        """在详情页中截图文章内容区域"""
+        try:
+            light_stats = await self._prepare_light_screenshot_surface(
+                page,
+                'article, .detail-content, .weibo-detail, .wbpro-scroller-item[data-index="0"]'
+            )
+            self.logger.info(f"    [light-screenshot] article DOM cleanup: {light_stats}")
+
+            # 只强制截图容器背景为白色，保留文字、图标等原始颜色
+            await page.evaluate("""
+                () => {
+                    const selectors = [
+                        'html', 'body', 'article', '.detail-content',
+                        '.weibo-detail', '.wbpro-scroller-item[data-index="0"]'
+                    ];
+                    for (const sel of selectors) {
+                        try {
+                            document.querySelectorAll(sel).forEach(el => {
+                                el.style.setProperty('background-color', '#ffffff', 'important');
+                                el.style.setProperty('background-image', 'none', 'important');
+                            });
+                        } catch(e) {
+                            // Ignore invalid selectors on page variants.
+                        }
+                    }
+                }
+            """)
+
+            # 隐藏所有固定/粘性元素
+            await page.evaluate("""
+                () => {
+                    const navSelectors = [
+                        '.s-top', '.S_top', '.s-topbar', '.topbar',
+                        '.gn_header', '.gnb', '.S_bg2',
+                        'nav', '.global-nav', '.gn_nav',
+                        '.main-top', '.top-bar',
+                        '.fixed-top', '.sticky-top',
+                        '[class*="topbar"]', '[class*="Topbar"]',
+                    ];
+                    for (const sel of navSelectors) {
+                        try {
+                            document.querySelectorAll(sel).forEach(el => {
+                                el.setAttribute('data-wb-hidden', '1');
+                                el.style.setProperty('display', 'none', 'important');
+                            });
+                        } catch(e) {}
+                    }
+                    // 隐藏所有 fixed/sticky 元素
+                    document.querySelectorAll('*').forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        if (style.position === 'fixed' || style.position === 'sticky') {
+                            el.setAttribute('data-wb-hidden', '1');
+                            el.style.setProperty('display', 'none', 'important');
+                        }
+                    });
+                }
+            """)
+
+            # 查找文章内容区域并截图
+            clip_info = await page.evaluate("""
+                () => {
+                    // 优先查找详情页的文章区域
+                    const selectors = [
+                        '.detail-content', '.weibo-detail',
+                        'article', '.wbpro-scroller-item[data-index="0"]',
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 50 && rect.width > 100) {
+                                return {
+                                    x: Math.round(rect.x),
+                                    y: Math.round(rect.y),
+                                    w: Math.round(rect.width),
+                                    h: Math.round(rect.height)
+                                };
+                            }
+                        }
+                    }
+                    return null;
+                }
+            """)
+
+            if clip_info and clip_info['h'] > 0:
+                clip = {
+                    'x': clip_info['x'],
+                    'y': clip_info['y'],
+                    'width': clip_info['w'],
+                    'height': min(clip_info['h'], 5000),
+                }
+                self.logger.info(f"    📐 [详情页截图] clip={clip}")
+                await page.screenshot(path=screenshot_path, clip=clip)
+                self.logger.info(f"    📸 [详情页截图] 成功 → {screenshot_path}")
+            else:
+                # 找不到文章区域，截取视口上半部分
+                viewport = page.viewport_size
+                clip = {'x': 0, 'y': 0, 'width': viewport['width'], 'height': min(viewport['height'], 1500)}
+                self.logger.info(f"    📐 [详情页截图] fallback clip={clip}")
+                await page.screenshot(path=screenshot_path, clip=clip)
+
+            # 恢复隐藏的元素
+            await page.evaluate("""
+                () => {
+                    document.querySelectorAll('[data-wb-hidden="1"]').forEach(el => {
+                        el.style.removeProperty('display');
+                        el.removeAttribute('data-wb-hidden');
+                    });
+                }
+            """)
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"    ❌ [详情页截图] 异常: {e}")
+            return False
 
     async def _get_recent_posts(self, page, author_name: str = '') -> List[Dict]:
         posts_data = await page.evaluate("""
@@ -444,238 +796,6 @@ class AuthorMonitor:
             pass
         return False
 
-    async def _screenshot_post_card(self, page, card_index: int, screenshot_path: str) -> bool:
-        try:
-            self.logger.info(f"    🔍 [文章截图] 开始 card_index={card_index}")
-
-            hide_result = await page.evaluate("""
-                () => {
-                    const selectors = [
-                        '.s-top', '.S_top', '.s-topbar', '.topbar', '.gn_header',
-                        'header', '.header', '.Header',
-                        '.ProfileHeader', '.profile-header',
-                        '.ProfileHeader_new', '.profile-header_new',
-                        '[class*="ProfileHeader"]', '[class*="profile-head"]',
-                        '.wb-proj-header', '.wb-header',
-                        'nav', '.global-nav', '.gn_nav',
-                        '.main-top', '.top-bar',
-                    ];
-                    let hidden = 0;
-                    for (const sel of selectors) {
-                        try {
-                            document.querySelectorAll(sel).forEach(el => {
-                                el.style.setProperty('display', 'none', 'important');
-                                el.style.setProperty('visibility', 'hidden', 'important');
-                                el.style.setProperty('height', '0px', 'important');
-                                el.style.setProperty('overflow', 'hidden', 'important');
-                            });
-                            hidden++;
-                        } catch(e) {}
-                    }
-
-                    const allEls = document.querySelectorAll('*');
-                    let stickyHidden = 0;
-                    let profileHidden = 0;
-                    for (const el of allEls) {
-                        const style = window.getComputedStyle(el);
-                        if (style.position === 'fixed' || style.position === 'sticky') {
-                            const rect = el.getBoundingClientRect();
-                            if (rect.y < 150 && rect.height > 20 && rect.height < 200) {
-                                el.style.setProperty('display', 'none', 'important');
-                                el.style.setProperty('visibility', 'hidden', 'important');
-                                stickyHidden++;
-                            }
-                        }
-
-                        const text = (el.innerText || '').trim();
-                        if ((text.includes('返回') && text.length < 30) ||
-                            (text.includes('关注') && text.includes('粉丝') && text.length < 200)) {
-                            el.style.setProperty('display', 'none', 'important');
-                            el.style.setProperty('visibility', 'hidden', 'important');
-                            el.style.setProperty('height', '0px', 'important');
-                            profileHidden++;
-                        }
-                    }
-
-                    return { selectorsHidden: hidden, stickyHidden: stickyHidden, profileHidden: profileHidden };
-                }
-            """)
-            self.logger.info(f"    🔍 [文章截图] 隐藏元素完成: {hide_result}")
-
-            total_items = await page.evaluate("""
-                () => document.querySelectorAll('.wbpro-scroller-item').length
-            """)
-            self.logger.info(f"    🔍 [文章截图] 页面共有 {total_items} 个 .wbpro-scroller-item 元素")
-
-            await page.evaluate(f"""
-                () => {{
-                    const items = document.querySelectorAll('.wbpro-scroller-item');
-                    if (items.length > {card_index}) items[{card_index}].scrollIntoView({{ behavior: 'instant', block: 'start' }});
-                }}
-            """)
-            self.logger.info(f"    🔍 [文章截图] scrollIntoView(block='start') 完成，等待2秒渲染")
-            await asyncio.sleep(2)
-
-            await page.evaluate(f"""
-                () => {{
-                    const items = document.querySelectorAll('.wbpro-scroller-item');
-                    if (items.length <= {card_index}) return;
-                    const item = items[{card_index}];
-                    const header = item.querySelector('header');
-                    if (header) {{
-                        header.style.setProperty('display', 'flex', 'important');
-                        header.style.setProperty('visibility', 'visible', 'important');
-                        header.style.setProperty('opacity', '1', 'important');
-                        header.style.setProperty('min-height', '52px', 'important');
-                    }}
-                    const avatarDiv = item.querySelector('[class*="avatar"]');
-                    if (avatarDiv) {{
-                        avatarDiv.style.setProperty('display', 'inline-block', 'important');
-                        avatarDiv.style.setProperty('visibility', 'visible', 'important');
-                        avatarDiv.style.setProperty('width', '52px', 'important');
-                        avatarDiv.style.setProperty('height', '52px', 'important');
-                    }}
-                    const avatarImg = item.querySelector('[class*="avatar"] img');
-                    if (avatarImg) {{
-                        avatarImg.style.setProperty('display', 'inline', 'important');
-                        avatarImg.style.setProperty('visibility', 'visible', 'important');
-                        avatarImg.style.setProperty('width', '52px', 'important');
-                        avatarImg.style.setProperty('height', '52px', 'important');
-                    }}
-                }}
-            """)
-            self.logger.info(f"    🔍 [文章截图] 强制渲染 header/avatar CSS 完成，等待1秒")
-            await asyncio.sleep(1)
-
-            for wait_i in range(8):
-                avatar_ok = await page.evaluate(f"""
-                    () => {{
-                        const items = document.querySelectorAll('.wbpro-scroller-item');
-                        if (items.length <= {card_index}) return false;
-                        const item = items[{card_index}];
-                        const avatar = item.querySelector('[class*="avatar"] img');
-                        if (!avatar) return true;
-                        const rect = avatar.getBoundingClientRect();
-                        return rect.width > 5 && rect.height > 5;
-                    }}
-                """)
-                if avatar_ok:
-                    self.logger.info(f"    ✅ [文章截图] 头像已渲染 (第{wait_i+1}次检查)")
-                    break
-                self.logger.debug(f"    ⏳ [文章截图] 头像未渲染，等待... (第{wait_i+1}次)")
-                await asyncio.sleep(1)
-            else:
-                self.logger.warning(f"    ⚠️ [文章截图] 头像8次检查后仍未渲染，继续截图")
-
-            screenshot_info = await page.evaluate(f"""
-                () => {{
-                    const items = document.querySelectorAll('.wbpro-scroller-item');
-                    if (items.length <= {card_index}) return null;
-                    const item = items[{card_index}];
-                    const rect = item.getBoundingClientRect();
-
-                    const articleEl = item.querySelector('article');
-                    const artRect = articleEl ? articleEl.getBoundingClientRect() : null;
-
-                    const avatar = item.querySelector('[class*="avatar"] img');
-                    const avatarRect = avatar ? avatar.getBoundingClientRect() : null;
-
-                    const header = item.querySelector('header');
-                    const headerRect = header ? header.getBoundingClientRect() : null;
-
-                    return {{
-                        item: {{ x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }},
-                        article: artRect ? {{ x: Math.round(artRect.x), y: Math.round(artRect.y), w: Math.round(artRect.width), h: Math.round(artRect.height) }} : null,
-                        avatar: avatarRect ? {{ x: Math.round(avatarRect.x), y: Math.round(avatarRect.y), w: Math.round(avatarRect.width), h: Math.round(avatarRect.height) }} : null,
-                        header: headerRect ? {{ x: Math.round(headerRect.x), y: Math.round(headerRect.y), w: Math.round(headerRect.width), h: Math.round(headerRect.height) }} : null,
-                    }};
-                }}
-            """)
-            self.logger.info(f"    📐 [文章截图] 截图前状态: item={screenshot_info.get('item')}, article={screenshot_info.get('article')}")
-
-            if not screenshot_info or not screenshot_info.get('item'):
-                self.logger.warning(f"    ❌ [文章截图] screenshot_info 为空，无法截图")
-                return False
-
-            target_rect = screenshot_info.get('article') or screenshot_info['item']
-            clip_x = max(0, int(target_rect['x']))
-            clip_y = max(0, int(target_rect['y']))
-            clip_w = int(target_rect['w'])
-            clip_h = min(int(target_rect['h']), 5000)
-
-            self.logger.info(f"    📐 [文章截图] 使用 clip 方式: x={clip_x} y={clip_y} w={clip_w} h={clip_h}")
-
-            clip = {'x': clip_x, 'y': clip_y, 'width': clip_w, 'height': clip_h}
-            await page.screenshot(path=screenshot_path, clip=clip)
-            self.logger.info(f"    📸 [文章截图] page.screenshot(clip) 成功 → {screenshot_path}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"    ❌ [文章截图] 异常: {e}", exc_info=True)
-            return False
-
-    async def _get_post_comments(self, detail_url: str, author_id: str,
-                                  article_index: int, safe_kw: str) -> list:
-        comment_models = []
-        detail_page = None
-
-        try:
-            if 'app.weibo.com/t/feed/' in detail_url:
-                feed_id = detail_url.split('/feed/')[-1].split('?')[0].split('#')[0]
-                if feed_id:
-                    detail_url = f"https://weibo.com/detail/{feed_id}"
-
-            if detail_url.startswith('sinaweibo://'):
-                return comment_models
-
-            detail_page = await self.browser.new_page()
-            nav_success = await self.browser.navigate_to(detail_page, detail_url, wait_for='domcontentloaded')
-
-            if not nav_success:
-                return comment_models
-
-            await asyncio.sleep(5)
-            await self._hide_navigation_bar(detail_page)
-
-            await detail_page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
-            await asyncio.sleep(2)
-
-            for scroll_i in range(3):
-                await detail_page.evaluate(f"window.scrollBy(0, {300 + scroll_i * 200})")
-                await asyncio.sleep(1)
-
-            for wait_i in range(5):
-                comment_count = await detail_page.evaluate("""
-                    () => {
-                        const items = document.querySelectorAll('.vue-recycle-scroller__item-view');
-                        let count = 0;
-                        for (const el of items) {
-                            const scrollerItem = el.querySelector('.wbpro-scroller-item');
-                            if (scrollerItem) {
-                                const di = parseInt(scrollerItem.getAttribute('data-index')) || 0;
-                                if (di > 0) count++;
-                            }
-                        }
-                        return count;
-                    }
-                """)
-                if comment_count > 0:
-                    self.logger.info(f"    评论区已加载，发现 {comment_count} 条评论元素")
-                    break
-                await asyncio.sleep(2)
-
-            comment_models = await self._screenshot_comments_from_detail_page(
-                detail_page, f"author_{author_id}", article_index, safe_kw
-            )
-
-        except Exception as e:
-            self.logger.warning(f"[AuthorMonitor] 获取评论失败: {e}")
-        finally:
-            if detail_page:
-                await self.browser.close_page(detail_page)
-
-        return comment_models
-
     async def _screenshot_comments_from_detail_page(self, page, keyword: str,
                                                       article_index: int, safe_kw: str) -> list:
         comment_models = []
@@ -683,6 +803,11 @@ class AuthorMonitor:
 
         try:
             self.logger.info(f"    🔍 [评论截图] 开始渐进式扫描评论区 (最多{self.max_comments_per_article}条)")
+
+            # 只清理截图背景和遮罩，不改文字/图标/徽标颜色。
+            await asyncio.sleep(0.5)
+            light_stats = await self._prepare_light_screenshot_surface(page, '.vue-recycle-scroller')
+            self.logger.info(f"    [light-screenshot] comments DOM cleanup: {light_stats}")
 
             max_scroll_rounds = 30
             no_new_count = 0
@@ -692,6 +817,7 @@ class AuthorMonitor:
                     self.logger.info(f"    🔍 [评论截图] 已达到最大评论数 {self.max_comments_per_article}，停止滚动")
                     break
 
+                await self._prepare_light_screenshot_surface(page, '.vue-recycle-scroller')
                 visible_comments = await page.evaluate("""
                     () => {
                         const vh = window.innerHeight;
@@ -784,8 +910,22 @@ class AuthorMonitor:
                                 if parent_box:
                                     ph = parent_box['height']
                                     if 10 < ph < 800:
-                                        self.logger.info(f"    📐 [评论截图] data-index={di} 高度检查通过: h={ph:.0f}，执行 element.screenshot")
-                                        await parent_el.screenshot(path=comment_screenshot_path)
+                                        self.logger.info(f"    📐 [评论截图] data-index={di} 高度检查通过: h={ph:.0f}，执行 page.screenshot(clip)")
+                                        # 滚动到元素位置确保在视口内
+                                        await element_handle.scroll_into_view_if_needed()
+                                        await asyncio.sleep(0.3)
+                                        await self._prepare_light_screenshot_surface(page, '.vue-recycle-scroller')
+                                        # 重新获取 bounding_box（滚动后位置变化）
+                                        parent_box = await parent_el.bounding_box()
+                                        if not parent_box:
+                                            self.logger.warning(f"    ❌ [评论截图] data-index={di} 滚动后 bounding_box 为空")
+                                            continue
+                                        # 使用 page.screenshot(clip) 以支持浅色主题
+                                        clip = self._clip_to_viewport(parent_box, page.viewport_size)
+                                        if not clip:
+                                            self.logger.warning(f"    ❌ [评论截图] data-index={di} clip 超出视口: {parent_box}")
+                                            continue
+                                        await page.screenshot(path=comment_screenshot_path, clip=clip)
                                         screenshot_saved = True
                                         self.logger.info(f"    📸 [评论截图] data-index={di} element.screenshot 成功 → {comment_screenshot_path}")
                                     else:
@@ -832,65 +972,33 @@ class AuthorMonitor:
         self.logger.info(f"    🔍 [评论截图] 最终结果: 扫描{len(processed_indices)}条, 截图{len(comment_models)}条")
         return comment_models
 
-    async def _hide_navigation_bar(self, page):
-        await page.evaluate("""
-            () => {
-                const navSelectors = [
-                    '.s-top', '.S_top', '.s-topbar', '.topbar',
-                    '.gn_header', '.gnb', '.S_bg2',
-                    'header', '.header', '[class*="topbar"]',
-                    '[class*="Topbar"]', '[class*="header"]', '[class*="Header"]',
-                    '.s-fram-nav', '.s-nav', '.m-con-top',
-                    '.pl-bread', '.s-top-nav',
-                    '.search-user-info', '.user-bar',
-                    '.top-nav .user', '.header-right',
-                    '[class*="user-info"]', '[class*="UserInfo"]',
-                    '[class*="login-user"]', '[class*="LoginUser"]',
-                    '.person-box', '.account-wrap',
-                    '.fixed-top', '.sticky-top',
-                ];
-                for (const sel of navSelectors) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (!el.hasAttribute('data-wb-nav-hidden')) {
-                                el.setAttribute('data-wb-nav-hidden', JSON.stringify({
-                                    display: el.style.display,
-                                    visibility: el.style.visibility,
-                                    position: el.style.position,
-                                    height: el.style.height
-                                }));
-                            }
-                            el.style.setProperty('display', 'none', 'important');
-                            el.style.setProperty('visibility', 'hidden', 'important');
-                            el.style.setProperty('height', '0px', 'important');
-                            el.style.setProperty('overflow', 'hidden', 'important');
-                            el.style.setProperty('position', 'absolute', 'important');
-                        });
-                    } catch(e) {}
-                }
-            }
-        """)
+    def _clip_to_viewport(self, box: Dict[str, Any], viewport: Optional[Dict[str, int]]) -> Optional[Dict[str, int]]:
+        """Clamp a Playwright bounding box to the current viewport."""
+        if not box or not viewport:
+            return None
 
-    async def _restore_navigation_bar(self, page):
-        await page.evaluate("""
-            () => {
-                document.querySelectorAll('[data-wb-nav-hidden]').forEach(el => {
-                    const prevStr = el.getAttribute('data-wb-nav-hidden');
-                    if (prevStr) {
-                        try {
-                            const prev = JSON.parse(prevStr);
-                            el.style.setProperty('display', prev.display || '', 'important');
-                            el.style.setProperty('visibility', prev.visibility || '', 'important');
-                            el.style.setProperty('height', prev.height || '', 'important');
-                            el.style.setProperty('overflow', '', 'important');
-                            el.style.setProperty('position', prev.position || '', 'important');
-                        } catch(e) {
-                            el.style.setProperty('display', '', 'important');
-                            el.style.setProperty('visibility', '', 'important');
-                            el.style.setProperty('height', '', 'important');
-                        }
-                        el.removeAttribute('data-wb-nav-hidden');
-                    }
-                });
-            }
-        """)
+        viewport_width = int(viewport.get('width') or 0)
+        viewport_height = int(viewport.get('height') or 0)
+        if viewport_width <= 0 or viewport_height <= 0:
+            return None
+
+        left = int(round(box.get('x', 0)))
+        top = int(round(box.get('y', 0)))
+        right = int(round(left + box.get('width', 0)))
+        bottom = int(round(top + box.get('height', 0)))
+
+        left = max(0, left)
+        top = max(0, top)
+        right = min(viewport_width, right)
+        bottom = min(viewport_height, bottom)
+
+        width = right - left
+        height = bottom - top
+        if width <= 1 or height <= 1:
+            return None
+
+        return {'x': left, 'y': top, 'width': width, 'height': height}
+
+    async def execute(self, *args, **kwargs) -> Dict[str, Any]:
+        """执行技能：监控所有作者"""
+        return await self.monitor_all_authors()

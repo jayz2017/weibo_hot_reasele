@@ -23,6 +23,10 @@ import argparse
 import sys
 import logging
 from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -30,6 +34,7 @@ sys.path.insert(0, str(project_root))
 from core.config_manager import ConfigManager
 from skills.browser_controller import BrowserController
 from skills.author_monitor import AuthorMonitor
+from skills.image_handler import ImageHandler
 from utils.mysql_manager import MySQLManager
 from utils.logger import setup_logger
 
@@ -95,7 +100,13 @@ async def run_author_monitor(config_path: str, author_id: str = None, headless: 
     if not headless:
         config['browser']['headless'] = False
 
-    logger = setup_logger("AuthorMonitor", level="DEBUG" if verbose else "INFO")
+    log_dir = Path(config.get('paths', {}).get('log_dir', './data/logs'))
+    log_file = log_dir / f"author_monitor_{datetime.now():%Y%m%d}.log"
+    logger = setup_logger(
+        "AuthorMonitor",
+        level="DEBUG" if verbose else "INFO",
+        log_file=str(log_file),
+    )
 
     browser = BrowserController(config, logger)
     await browser.start_browser()
@@ -105,8 +116,10 @@ async def run_author_monitor(config_path: str, author_id: str = None, headless: 
     if mysql_config.get('enabled', False):
         mysql = MySQLManager(mysql_config, logger)
 
+    image_handler = ImageHandler(config, logger)
+
     try:
-        monitor = AuthorMonitor(config, browser, mysql, logger)
+        monitor = AuthorMonitor(config, logger, browser=browser, mysql=mysql, image_handler=image_handler)
 
         if author_id:
             result = await monitor.monitor_author(author_id)

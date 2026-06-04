@@ -28,6 +28,9 @@ import argparse
 import sys
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))

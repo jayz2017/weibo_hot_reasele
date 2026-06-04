@@ -18,15 +18,32 @@ def setup_logger(name: str = "weibo_crawler",
     """
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper()))
-    
-    if not logger.handlers:
-        formatter = logging.Formatter(format_str)
-        
+
+    formatter = logging.Formatter(format_str)
+
+    has_console_handler = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        for handler in logger.handlers
+    )
+    if not has_console_handler:
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
-        
-        if log_file:
+
+    if log_file:
+        log_path = str(Path(log_file).resolve())
+        has_file_handler = any(
+            isinstance(handler, logging.FileHandler)
+            and str(Path(handler.baseFilename).resolve()) == log_path
+            for handler in logger.handlers
+        )
+        if not has_file_handler:
             Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             file_handler = logging.FileHandler(log_file, encoding='utf-8')
             file_handler.setFormatter(formatter)

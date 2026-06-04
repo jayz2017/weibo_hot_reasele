@@ -1,0 +1,11 @@
+- [x] ImageHandler Skill 创建完成，继承BaseSkill，实现screenshot_element/screenshot_clip/generate_screenshot_path方法
+- [x] ContentCollector Skill 创建完成，从PipelineManager提取搜索页导航+卡片定位逻辑
+- [x] ArticleProcessor Skill 创建完成，从PipelineManager提取文章截图+Model构建逻辑
+- [x] CommentProcessor Skill 创建完成，从PipelineManager提取评论区遍历+逐条截图逻辑
+- [x] PipelineManager 精简至 393行纯编排代码（原963行，-59.2%），所有业务逻辑已迁移至各Skill
+- [x] BrowserController 已规范化为继承BaseSkill的标准Skill
+- [x] author_monitor.py 已重构为 AuthorMonitor(BaseSkill)
+- [x] zhibo8_match_scraper.py 已重构为 Zhibo8MatchScraper(BaseSkill)
+- [x] 所有22个模块导入验证通过（11个Skill + 3个基础模块 + 4个Model）
+- [x] 全部11个Skill均正确继承BaseSkill并实现execute()接口
+- [x] PipelineManager._initialize_skills() 正确实例化9个Skill（5原有 + 4新增）
