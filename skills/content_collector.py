@@ -19,12 +19,16 @@ class ContentCollector(BaseSkill):
     4. 详情URL转换
     """
 
-    def __init__(self, config: dict, logger: logging.Logger, *, browser=None, image_handler=None):
+    def __init__(self, config: dict, logger: logging.Logger, *, browser=None, image_handler=None, path_manager=None):
         self.browser = browser
         self.image_handler = image_handler
-        paths_config = config.get('paths', {})
-        self.screenshot_dir = Path(paths_config.get('screenshot_dir', './data/screenshots'))
-        ensure_dir(str(self.screenshot_dir))
+        if path_manager is not None:
+            self.path_manager = path_manager
+            self.screenshot_dir = path_manager.base_dir
+        else:
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+            self.screenshot_dir = self.path_manager.base_dir
         super().__init__(config, logger)
 
     def _initialize(self):

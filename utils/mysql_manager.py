@@ -1,5 +1,6 @@
 import pymysql
 import logging
+import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from contextlib import contextmanager
@@ -104,11 +105,66 @@ class MySQLManager:
                         INDEX idx_match_id (match_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS wb_semantic_analysis (
+                        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                        source_type VARCHAR(20) NOT NULL DEFAULT 'article',
+                        source_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                        article_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                        article_url VARCHAR(500) NOT NULL DEFAULT '',
+                        keyword VARCHAR(200) NOT NULL DEFAULT '',
+                        author_name VARCHAR(200) NOT NULL DEFAULT '',
+                        text_hash CHAR(64) NOT NULL DEFAULT '',
+                        text_length INT NOT NULL DEFAULT 0,
+                        summary VARCHAR(500) NOT NULL DEFAULT '',
+                        sentiment_label VARCHAR(20) NOT NULL DEFAULT '',
+                        sentiment_score DECIMAL(6,4) NOT NULL DEFAULT 0,
+                        primary_emotion VARCHAR(30) NOT NULL DEFAULT '',
+                        stance_label VARCHAR(30) NOT NULL DEFAULT '',
+                        stance_polarity DECIMAL(6,4) NOT NULL DEFAULT 0,
+                        conflict_score DECIMAL(6,4) NOT NULL DEFAULT 0,
+                        value_labels JSON NULL,
+                        concept_labels JSON NULL,
+                        keywords JSON NULL,
+                        viewpoints JSON NULL,
+                        emotions JSON NULL,
+                        analysis_json JSON NULL,
+                        analysis_version VARCHAR(50) NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_source_analysis (source_type, source_id, analysis_version),
+                        INDEX idx_article_type (article_id, source_type),
+                        INDEX idx_keyword_conflict (keyword, conflict_score),
+                        INDEX idx_sentiment (sentiment_label, sentiment_score),
+                        INDEX idx_stance (stance_label, stance_polarity),
+                        INDEX idx_emotion (primary_emotion)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """)
+                self._ensure_column(
+                    cursor,
+                    "wb_semantic_analysis",
+                    "concept_labels",
+                    "JSON NULL AFTER value_labels",
+                )
                 conn.commit()
-                self.logger.info("[MySQL] 数据表初始化完成 (wb_article, wb_comment, zb8_match_comment)")
+                self.logger.info("[MySQL] 数据表初始化完成 (wb_article, wb_comment, zb8_match_comment, wb_semantic_analysis)")
         except Exception as e:
             self.logger.error(f"[MySQL] 建表失败: {e}")
             raise
+
+    def _ensure_column(self, cursor, table_name: str, column_name: str, column_definition: str):
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+            """,
+            (self.database, table_name, column_name),
+        )
+        row = cursor.fetchone() or {}
+        if int(row.get('total') or 0) == 0:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+            self.logger.info(f"[MySQL] 已补充字段 {table_name}.{column_name}")
 
     def save_article(self, article_data: Dict[str, Any]) -> int:
         with self.get_connection() as conn:
@@ -231,6 +287,101 @@ class MySQLManager:
             self.logger.info(f"[MySQL] 批量插入评论 {count} 条 (跳过重复{skipped}条) article_id={article_id}")
             return count
 
+    def save_semantic_analysis(self, analysis_data: Dict[str, Any]) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            db_id = self._upsert_semantic_analysis(cursor, analysis_data)
+            conn.commit()
+            self.logger.info(
+                "[MySQL] 语义分析已保存 source=%s:%s id=%s",
+                analysis_data.get('source_type', ''),
+                analysis_data.get('source_id', 0),
+                db_id,
+            )
+            return db_id
+
+    def save_semantic_analysis_batch(self, analyses: List[Dict[str, Any]]) -> int:
+        if not analyses:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            saved = 0
+            for analysis_data in analyses:
+                self._upsert_semantic_analysis(cursor, analysis_data)
+                saved += 1
+            conn.commit()
+            self.logger.info(f"[MySQL] 批量保存语义分析 {saved} 条")
+            return saved
+
+    def _upsert_semantic_analysis(self, cursor, data: Dict[str, Any]) -> int:
+        source_type = data.get('source_type', 'article')
+        source_id = int(data.get('source_id') or 0)
+        analysis_version = data.get('analysis_version', '')
+        values = (
+            source_type,
+            source_id,
+            int(data.get('article_id') or 0),
+            data.get('article_url', ''),
+            data.get('keyword', ''),
+            data.get('author_name', ''),
+            data.get('text_hash', ''),
+            int(data.get('text_length') or 0),
+            data.get('summary', '')[:500],
+            data.get('sentiment_label', ''),
+            float(data.get('sentiment_score') or 0),
+            data.get('primary_emotion', ''),
+            data.get('stance_label', ''),
+            float(data.get('stance_polarity') or 0),
+            float(data.get('conflict_score') or 0),
+            self._json_dumps(data.get('value_labels', [])),
+            self._json_dumps(data.get('concept_labels', [])),
+            self._json_dumps(data.get('keywords', [])),
+            self._json_dumps(data.get('viewpoints', [])),
+            self._json_dumps(data.get('emotions', [])),
+            self._json_dumps(data.get('analysis', {})),
+            analysis_version,
+        )
+        cursor.execute("""
+            INSERT INTO wb_semantic_analysis (
+                source_type, source_id, article_id, article_url, keyword, author_name,
+                text_hash, text_length, summary, sentiment_label, sentiment_score,
+                primary_emotion, stance_label, stance_polarity, conflict_score,
+                value_labels, concept_labels, keywords, viewpoints, emotions, analysis_json, analysis_version
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                article_id=VALUES(article_id),
+                article_url=VALUES(article_url),
+                keyword=VALUES(keyword),
+                author_name=VALUES(author_name),
+                text_hash=VALUES(text_hash),
+                text_length=VALUES(text_length),
+                summary=VALUES(summary),
+                sentiment_label=VALUES(sentiment_label),
+                sentiment_score=VALUES(sentiment_score),
+                primary_emotion=VALUES(primary_emotion),
+                stance_label=VALUES(stance_label),
+                stance_polarity=VALUES(stance_polarity),
+                conflict_score=VALUES(conflict_score),
+                value_labels=VALUES(value_labels),
+                concept_labels=VALUES(concept_labels),
+                keywords=VALUES(keywords),
+                viewpoints=VALUES(viewpoints),
+                emotions=VALUES(emotions),
+                analysis_json=VALUES(analysis_json)
+        """, values)
+        if cursor.lastrowid:
+            return cursor.lastrowid
+        cursor.execute(
+            "SELECT id FROM wb_semantic_analysis WHERE source_type=%s AND source_id=%s AND analysis_version=%s",
+            (source_type, source_id, analysis_version),
+        )
+        row = cursor.fetchone()
+        return row['id'] if row else 0
+
+    def _json_dumps(self, value: Any) -> str:
+        return json.dumps(value if value is not None else [], ensure_ascii=False, separators=(',', ':'))
+
     def get_article_by_url(self, url: str) -> Optional[Dict]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -243,6 +394,78 @@ class MySQLManager:
             cursor.execute("SELECT * FROM wb_comment WHERE article_id = %s ORDER BY id LIMIT %s",
                            (article_id, limit))
             return cursor.fetchall()
+
+    def get_semantic_analysis_by_article_id(self, article_id: int) -> List[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT * FROM wb_semantic_analysis
+                   WHERE article_id = %s
+                   ORDER BY source_type = 'article' DESC, conflict_score DESC, id""",
+                (article_id,),
+            )
+            return cursor.fetchall()
+
+    def get_hotspot_viewpoints(
+        self,
+        keyword: str = None,
+        article_id: int = None,
+        limit: int = 30,
+        min_conflict_score: float = 0.0,
+    ) -> List[Dict]:
+        conditions = ["conflict_score >= %s"]
+        params: List[Any] = [min_conflict_score]
+        if keyword:
+            conditions.append("keyword LIKE %s")
+            params.append(f"%{keyword}%")
+        if article_id:
+            conditions.append("article_id = %s")
+            params.append(article_id)
+        where_clause = " AND ".join(conditions)
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""SELECT * FROM wb_semantic_analysis
+                    WHERE {where_clause}
+                    ORDER BY conflict_score DESC, ABS(stance_polarity) DESC, id DESC
+                    LIMIT %s""",
+                params + [limit],
+            )
+            return cursor.fetchall()
+
+    def get_hotspot_semantic_summary(self, keyword: str = None, article_id: int = None) -> Dict[str, Any]:
+        conditions = []
+        params: List[Any] = []
+        if keyword:
+            conditions.append("keyword LIKE %s")
+            params.append(f"%{keyword}%")
+        if article_id:
+            conditions.append("article_id = %s")
+            params.append(article_id)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""SELECT source_type, sentiment_label, stance_label, primary_emotion,
+                           COUNT(*) AS total, AVG(conflict_score) AS avg_conflict
+                    FROM wb_semantic_analysis
+                    {where_clause}
+                    GROUP BY source_type, sentiment_label, stance_label, primary_emotion
+                    ORDER BY total DESC, avg_conflict DESC""",
+                params,
+            )
+            groups = cursor.fetchall()
+            cursor.execute(
+                f"""SELECT COUNT(*) AS total, AVG(conflict_score) AS avg_conflict,
+                           MAX(conflict_score) AS max_conflict
+                    FROM wb_semantic_analysis
+                    {where_clause}""",
+                params,
+            )
+            totals = cursor.fetchone() or {}
+        return {"totals": totals, "groups": groups}
 
     def save_zhibo8_comment(self, comment_data: Dict[str, Any]) -> int:
         with self.get_connection() as conn:

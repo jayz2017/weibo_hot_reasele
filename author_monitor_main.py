@@ -116,10 +116,12 @@ async def run_author_monitor(config_path: str, author_id: str = None, headless: 
     if mysql_config.get('enabled', False):
         mysql = MySQLManager(mysql_config, logger)
 
-    image_handler = ImageHandler(config, logger)
+    from utils.screenshot_path_manager import ScreenshotPathManager
+    path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+    image_handler = ImageHandler(config, logger, path_manager=path_manager)
 
     try:
-        monitor = AuthorMonitor(config, logger, browser=browser, mysql=mysql, image_handler=image_handler)
+        monitor = AuthorMonitor(config, logger, browser=browser, mysql=mysql, image_handler=image_handler, path_manager=path_manager)
 
         if author_id:
             result = await monitor.monitor_author(author_id)

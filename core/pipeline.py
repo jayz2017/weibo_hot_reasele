@@ -15,6 +15,7 @@ from skills.image_handler import ImageHandler
 from skills.content_collector import ContentCollector
 from skills.article_processor import ArticleProcessor
 from skills.comment_processor import CommentProcessor
+from skills.semantic_analyzer import SemanticAnalyzer
 from utils.logger import setup_logger as _setup_logger
 from utils.file_utils import clean_filename
 from models.article_model import ArticleModel
@@ -64,10 +65,13 @@ class PipelineManager:
             self.data_extractor = DataExtractor(self.config, self.logger)
             self.storage = StorageManager(self.config, self.logger)
 
-            self.image_handler = ImageHandler(self.config, self.logger)
-            self.content_collector = ContentCollector(self.config, self.logger, browser=self.browser, image_handler=self.image_handler)
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = ScreenshotPathManager(self.config.get('screenshot', self.config.get('paths', {})), self.logger)
+            self.image_handler = ImageHandler(self.config, self.logger, path_manager=self.path_manager)
+            self.content_collector = ContentCollector(self.config, self.logger, browser=self.browser, image_handler=self.image_handler, path_manager=self.path_manager)
             self.article_processor = ArticleProcessor(self.config, self.logger, image_handler=self.image_handler)
             self.comment_processor = CommentProcessor(self.config, self.logger, image_handler=self.image_handler)
+            self.semantic_analyzer = SemanticAnalyzer(self.config, self.logger)
 
             mysql_config = self.config.get('mysql', {})
             if mysql_config.get('enabled', False):
@@ -86,6 +90,7 @@ class PipelineManager:
                 'content_collector': self.content_collector,
                 'article_processor': self.article_processor,
                 'comment_processor': self.comment_processor,
+                'semantic_analyzer': self.semantic_analyzer,
             }
             self.logger.info(f"成功初始化 {len(self.skills)} 个Skills")
         except Exception as e:
@@ -247,6 +252,7 @@ class PipelineManager:
                         if article_comments:
                             comments_data = [c.to_dict() for c in article_comments]
                             self.mysql.save_comments_batch(comments_data, article_id)
+                        self._save_semantic_analysis(article, article_id)
                     except Exception as db_err:
                         self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
 
@@ -380,6 +386,7 @@ class PipelineManager:
                         if article_comments:
                             comments_data = [c.to_dict() for c in article_comments]
                             self.mysql.save_comments_batch(comments_data, article_id)
+                        self._save_semantic_analysis(article, article_id)
                     except Exception as db_err:
                         self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
             if comments:
@@ -391,3 +398,30 @@ class PipelineManager:
             self.crawler.close()
             if self.mysql:
                 self.mysql.close()
+
+    def _save_semantic_analysis(self, article: ArticleModel, article_id: int):
+        if not self.mysql or not self.semantic_analyzer or not self.semantic_analyzer.enabled:
+            return
+
+        article_analysis = self.semantic_analyzer.analyze_record(
+            article,
+            source_type='article',
+            source_id=article_id,
+            article_id=article_id,
+            keyword=article.keyword,
+        )
+        self.mysql.save_semantic_analysis(article_analysis)
+
+        comment_rows = self.mysql.get_comments_by_article_id(article_id, limit=200)
+        comment_analyses = [
+            self.semantic_analyzer.analyze_record(
+                row,
+                source_type='comment',
+                source_id=row.get('id', 0),
+                article_id=article_id,
+                keyword=article.keyword,
+            )
+            for row in comment_rows
+        ]
+        if comment_analyses:
+            self.mysql.save_semantic_analysis_batch(comment_analyses)

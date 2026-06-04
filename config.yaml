@@ -53,11 +53,13 @@ storage:
   enable_backup: true
 
 screenshot:
-  articles_dir: "articles"
-  comments_dir: "comments"
-  format: png
-  quality: 90
-  delay_before_screenshot: 2000
+  base_dir: "G:/weibo_hot_screenshots"   # 截图根目录（G盘，单独存放，不在项目目录内）
+  articles_subdir: "articles"         # 微博文章截图子目录
+  comments_subdir: "comments"         # 微博评论截图子目录
+  zhibo8_subdir: "zhibo8_comments"    # 直播吧评论截图子目录
+  format: png                         # 图片格式 (png/jpeg)
+  quality: 90                         # JPEG 质量
+  delay_before_screenshot: 2000       # 截图前等待时间(毫秒)
 
 comment:
   max_comments: 20
@@ -69,6 +71,12 @@ author_monitor:
 
 extract:
   max_text_length: 5000
+
+semantic_analysis:
+  enabled: true
+  keyword_top_k: 8
+  viewpoint_top_k: 3
+  max_text_length: 2000
 
 logging:
   level: "INFO"

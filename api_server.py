@@ -174,6 +174,8 @@ async def root():
             {"path": "/api/articles", "method": "GET", "desc": "查询文章列表"},
             {"path": "/api/articles/{article_id}", "method": "GET", "desc": "查询单篇文章"},
             {"path": "/api/comments", "method": "GET", "desc": "查询评论列表"},
+            {"path": "/api/semantic/articles/{article_id}", "method": "GET", "desc": "查询文章与评论语义标注"},
+            {"path": "/api/semantic/viewpoints", "method": "GET", "desc": "查询热点观点冲突池"},
             {"path": "/api/zhibo8/comments", "method": "GET", "desc": "查询直播吧评论"},
             {"path": "/api/zhibo8/matches", "method": "GET", "desc": "查询比赛列表"},
             {"path": "/api/pipeline/run", "method": "POST", "desc": "触发采集流水线"},
@@ -264,6 +266,44 @@ async def list_comments(
         raise HTTPException(status_code=503, detail="MySQL未启用")
     total, rows = mysql.get_comments(article_url=article_url, author_name=author_name, page=page, page_size=page_size)
     return ResponseModel(data={"total": total, "page": page, "page_size": page_size, "items": rows})
+
+
+@app.get("/api/semantic/articles/{article_id}", tags=["语义分析"], response_model=ResponseModel)
+async def get_article_semantics(article_id: int):
+    if not mysql:
+        raise HTTPException(status_code=503, detail="MySQL未启用")
+    article = mysql.get_article_by_id(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail=f"文章 {article_id} 不存在")
+    analyses = mysql.get_semantic_analysis_by_article_id(article_id)
+    return ResponseModel(data={
+        "article": article,
+        "total": len(analyses),
+        "items": analyses,
+    })
+
+
+@app.get("/api/semantic/viewpoints", tags=["语义分析"], response_model=ResponseModel)
+async def list_semantic_viewpoints(
+    keyword: Optional[str] = Query(None, description="按热点关键词筛选"),
+    article_id: Optional[int] = Query(None, description="按文章ID筛选"),
+    min_conflict_score: float = Query(0.0, ge=0.0, le=1.0, description="最低冲突分"),
+    limit: int = Query(30, ge=1, le=100, description="返回条数"),
+):
+    if not mysql:
+        raise HTTPException(status_code=503, detail="MySQL未启用")
+    rows = mysql.get_hotspot_viewpoints(
+        keyword=keyword,
+        article_id=article_id,
+        limit=limit,
+        min_conflict_score=min_conflict_score,
+    )
+    summary = mysql.get_hotspot_semantic_summary(keyword=keyword, article_id=article_id)
+    return ResponseModel(data={
+        "summary": summary,
+        "total": len(rows),
+        "items": rows,
+    })
 
 
 @app.get("/api/zhibo8/comments", tags=["直播吧"], response_model=ResponseModel)

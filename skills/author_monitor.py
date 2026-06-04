@@ -9,18 +9,33 @@ from models.comment_model import CommentModel
 from utils.mysql_manager import MySQLManager
 from utils.file_utils import generate_filename, clean_filename
 from core.base import BaseSkill
+from skills.semantic_analyzer import SemanticAnalyzer
 
 
 class AuthorMonitor(BaseSkill):
-    def __init__(self, config: Dict[str, Any], logger: logging.Logger, *, browser=None, mysql: Optional[MySQLManager] = None, image_handler=None):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        logger: logging.Logger,
+        *,
+        browser=None,
+        mysql: Optional[MySQLManager] = None,
+        image_handler=None,
+        path_manager=None,
+        semantic_analyzer: Optional[SemanticAnalyzer] = None,
+    ):
         super().__init__(config, logger)
         self.browser = browser
         self.mysql = mysql
         self.image_handler = image_handler
-
-        paths_config = config.get('paths', {})
-        self.screenshot_dir = Path(paths_config.get('screenshot_dir', './data/screenshots'))
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.semantic_analyzer = semantic_analyzer or SemanticAnalyzer(config, logger)
+        if path_manager is not None:
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = path_manager
+        else:
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+        self.screenshot_dir = self.path_manager.base_dir
 
         self.monitor_minutes = config.get('author_monitor', {}).get('monitor_minutes', 30)
         self.max_articles_per_author = config.get('author_monitor', {}).get('max_articles_per_author', 5)
@@ -54,6 +69,7 @@ class AuthorMonitor(BaseSkill):
                             if article_comments:
                                 comments_data = [c.to_dict() for c in article_comments]
                                 self.mysql.save_comments_batch(comments_data, article_id)
+                            self._save_semantic_analysis(article, article_id)
                         except Exception as db_err:
                             self.logger.error(f"[AuthorMonitor] MySQL存储失败: {db_err}")
 
@@ -81,10 +97,41 @@ class AuthorMonitor(BaseSkill):
                     if article_comments:
                         comments_data = [c.to_dict() for c in article_comments]
                         self.mysql.save_comments_batch(comments_data, article_id)
+                    self._save_semantic_analysis(article, article_id)
                 except Exception as db_err:
                     self.logger.error(f"[AuthorMonitor] MySQL存储失败: {db_err}")
 
         return {"author_id": author_id, "articles": len(articles), "comments": len(comments)}
+
+    def _save_semantic_analysis(self, article: ArticleModel, article_id: int):
+        if not self.mysql or not self.semantic_analyzer or not self.semantic_analyzer.enabled:
+            return
+
+        article_analysis = self.semantic_analyzer.analyze_record(
+            article,
+            source_type='article',
+            source_id=article_id,
+            article_id=article_id,
+            keyword=article.keyword,
+        )
+        self.mysql.save_semantic_analysis(article_analysis)
+
+        comment_rows = self.mysql.get_comments_by_article_id(
+            article_id,
+            limit=max(self.max_comments_per_article * 3, 100),
+        )
+        comment_analyses = [
+            self.semantic_analyzer.analyze_record(
+                row,
+                source_type='comment',
+                source_id=row.get('id', 0),
+                article_id=article_id,
+                keyword=article.keyword,
+            )
+            for row in comment_rows
+        ]
+        if comment_analyses:
+            self.mysql.save_semantic_analysis_batch(comment_analyses)
 
     def _get_author_ids_from_db(self) -> List[Dict[str, str]]:
         if not self.mysql:
@@ -204,8 +251,7 @@ class AuthorMonitor(BaseSkill):
 
                     # 进入详情页，截图文章内容 + 评论
                     article_screenshot_name = generate_filename(safe_kw, f'article_{i}', '.png')
-                    article_screenshot_path = str(self.screenshot_dir / 'articles' / article_screenshot_name)
-                    Path(article_screenshot_path).parent.mkdir(parents=True, exist_ok=True)
+                    article_screenshot_path = self.path_manager.get_path('articles', article_screenshot_name)
 
                     article_data, post_comments = await self._process_detail_page(
                         detail_url, author_id, author_name, i, safe_kw,
@@ -894,8 +940,7 @@ class AuthorMonitor(BaseSkill):
 
                     seq = len(processed_indices) - 1
                     comment_screenshot_name = generate_filename(safe_kw, f'comment_{article_index}_{seq}', '.png')
-                    comment_screenshot_path = str(self.screenshot_dir / 'comments' / comment_screenshot_name)
-                    Path(comment_screenshot_path).parent.mkdir(parents=True, exist_ok=True)
+                    comment_screenshot_path = self.path_manager.get_path('comments', comment_screenshot_name)
 
                     screenshot_saved = False
                     try:

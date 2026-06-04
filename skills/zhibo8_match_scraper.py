@@ -13,16 +13,19 @@ from core.base import BaseSkill
 
 
 class Zhibo8MatchScraper(BaseSkill):
-    def __init__(self, config: Dict[str, Any], logger: logging.Logger, *, browser=None, mysql: Optional[MySQLManager] = None):
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger, *, browser=None, mysql: Optional[MySQLManager] = None, path_manager=None):
         super().__init__(config, logger)
         self.browser = browser
         self.mysql = mysql
-
-        zhibo8_config = config.get('zhibo8', {})
-        screenshot_dir = zhibo8_config.get('screenshot_dir', './data/screenshots/zhibo8_comments')
-        self.screenshot_dir = Path(screenshot_dir)
+        if path_manager is not None:
+            self.path_manager = path_manager
+        else:
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+        self.screenshot_dir = self.path_manager.zhibo8_dir
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
+        zhibo8_config = config.get('zhibo8', {})
         self.max_comments = zhibo8_config.get('max_comments', 30)
         self.wait_for_comments = zhibo8_config.get('wait_for_comments', 8000)
 

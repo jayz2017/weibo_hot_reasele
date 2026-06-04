@@ -141,8 +141,11 @@ async def run_zhibo8_scraper(config_path: str, url: str, headless: bool = True, 
     if mysql_config.get('enabled', False):
         mysql = MySQLManager(mysql_config, logger)
 
+    from utils.screenshot_path_manager import ScreenshotPathManager
+    path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+
     try:
-        scraper = Zhibo8MatchScraper(config, logger, browser=simple_browser, mysql=mysql)
+        scraper = Zhibo8MatchScraper(config, logger, browser=simple_browser, mysql=mysql, path_manager=path_manager)
         result = await scraper.scrape_match(url)
 
         error = result.get('error')

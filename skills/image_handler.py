@@ -17,9 +17,14 @@ class ImageHandler(BaseSkill):
     5. 截图路径生成 (generate_screenshot_path)
     """
 
-    def __init__(self, config: dict, logger: logging.Logger):
-        paths_config = config.get('paths', {})
-        self.screenshot_dir = Path(paths_config.get('screenshot_dir', './screenshots'))
+    def __init__(self, config: dict, logger: logging.Logger, *, path_manager=None):
+        if path_manager is not None:
+            self.path_manager = path_manager
+            self.screenshot_dir = path_manager.base_dir
+        else:
+            from utils.screenshot_path_manager import ScreenshotPathManager
+            self.path_manager = ScreenshotPathManager(config.get('screenshot', config.get('paths', {})), logger)
+            self.screenshot_dir = self.path_manager.base_dir
         ensure_dir(str(self.screenshot_dir))
         super().__init__(config, logger)
 
