@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from contextlib import contextmanager
 from dbutils.pooled_db import PooledDB
+from utils.weibo_url_utils import normalize_weibo_detail_url
 
 
 class MySQLManager:
@@ -146,6 +147,11 @@ class MySQLManager:
                     "concept_labels",
                     "JSON NULL AFTER value_labels",
                 )
+                # 为 wb_comment 添加外键约束（如果不存在且用户有权限）
+                self._ensure_foreign_key(
+                    cursor, "wb_comment", "fk_comment_article",
+                    "article_id", "wb_article", "id"
+                )
                 conn.commit()
                 self.logger.info("[MySQL] 数据表初始化完成 (wb_article, wb_comment, zb8_match_comment, wb_semantic_analysis)")
         except Exception as e:
@@ -166,24 +172,56 @@ class MySQLManager:
             cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
             self.logger.info(f"[MySQL] 已补充字段 {table_name}.{column_name}")
 
+    def _ensure_foreign_key(self, cursor, table_name: str, fk_name: str,
+                            column: str, ref_table: str, ref_column: str):
+        """检查并添加外键约束（如果不存在且用户有权限）"""
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = %s AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """,
+            (self.database, table_name, fk_name),
+        )
+        row = cursor.fetchone() or {}
+        if int(row.get('total') or 0) == 0:
+            try:
+                cursor.execute(
+                    f"ALTER TABLE {table_name} ADD CONSTRAINT {fk_name} "
+                    f"FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}) "
+                    f"ON DELETE CASCADE ON UPDATE CASCADE"
+                )
+                self.logger.info(f"[MySQL] 已添加外键 {table_name}.{column} -> {ref_table}.{ref_column}")
+            except Exception as e:
+                # 权限不足时回滚当前事务，避免影响后续操作
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+                self.logger.warning(f"[MySQL] 外键添加跳过（权限不足或数据不一致）: {e}")
+
     def save_article(self, article_data: Dict[str, Any]) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            url = article_data.get('url', '')
+            raw_url = article_data.get('url', '')
+            url = normalize_weibo_detail_url(raw_url)
             existing = None
-            if url:
-                cursor.execute("SELECT id FROM wb_article WHERE url = %s", (url,))
+            lookup_urls = [item for item in dict.fromkeys([url, raw_url]) if item]
+            if lookup_urls:
+                placeholders = ",".join(["%s"] * len(lookup_urls))
+                cursor.execute(f"SELECT id FROM wb_article WHERE url IN ({placeholders}) LIMIT 1", lookup_urls)
                 existing = cursor.fetchone()
 
             if existing:
                 article_id = existing['id']
                 cursor.execute("""
                     UPDATE wb_article SET
-                        title=%s, author_name=%s, author_id=%s, content_text=%s,
+                        url=%s, title=%s, author_name=%s, author_id=%s, content_text=%s,
                         publish_time=%s, repost_count=%s, comment_count=%s, like_count=%s,
                         keyword=%s, screenshot_path=%s
                     WHERE id=%s
                 """, (
+                    url,
                     article_data.get('title', ''),
                     article_data.get('author_name', ''),
                     article_data.get('author_id', ''),
@@ -224,13 +262,14 @@ class MySQLManager:
     def save_comment(self, comment_data: Dict[str, Any], article_id: int = 0) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            article_url = normalize_weibo_detail_url(comment_data.get('article_url', ''))
             cursor.execute("""
                 INSERT INTO wb_comment (article_id, article_url, comment_id, content_text,
                     author_name, author_id, like_count, screenshot_path)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 article_id,
-                comment_data.get('article_url', ''),
+                article_url,
                 comment_data.get('comment_id', ''),
                 comment_data.get('content_text', ''),
                 comment_data.get('author_name', ''),
@@ -244,29 +283,56 @@ class MySQLManager:
             return comment_id
 
     def save_comments_batch(self, comments_data: List[Dict[str, Any]], article_id: int = 0) -> int:
+        saved_count, _ = self._save_comments_batch(comments_data, article_id)
+        return saved_count
+
+    def save_comments_batch_return_rows(self, comments_data: List[Dict[str, Any]], article_id: int = 0) -> List[Dict[str, Any]]:
+        _, rows = self._save_comments_batch(comments_data, article_id)
+        return rows
+
+    def _save_comments_batch(self, comments_data: List[Dict[str, Any]], article_id: int = 0) -> tuple[int, List[Dict[str, Any]]]:
         if not comments_data:
-            return 0
+            return 0, []
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT content_text FROM wb_comment WHERE article_id = %s",
+                "SELECT id, content_text, author_name FROM wb_comment WHERE article_id = %s",
                 (article_id,)
             )
-            existing_texts = {row['content_text'] for row in cursor.fetchall()}
+            existing_rows = cursor.fetchall()
+            existing_texts = {row['content_text'] for row in existing_rows}
+            # 构建 content_text -> (id, author_name) 映射，用于补全空 author_name
+            existing_map = {}
+            for row in existing_rows:
+                existing_map[row['content_text']] = (row['id'], row.get('author_name', '') or '')
 
             rows = []
+            requested_texts = []
             skipped = 0
+            updated = 0
             for cd in comments_data:
                 content = cd.get('content_text', '')
+                new_author = cd.get('author_name', '')
+                if content:
+                    requested_texts.append(content)
                 if content and content in existing_texts:
+                    # 如果已有记录 author_name 为空且新数据有值，则更新
+                    old_id, old_author = existing_map.get(content, (0, ''))
+                    if not old_author and new_author:
+                        cursor.execute(
+                            "UPDATE wb_comment SET author_name=%s WHERE id=%s",
+                            (new_author, old_id)
+                        )
+                        updated += 1
                     skipped += 1
                     continue
+                article_url = normalize_weibo_detail_url(cd.get('article_url', ''))
                 rows.append((
                     article_id,
-                    cd.get('article_url', ''),
+                    article_url,
                     cd.get('comment_id', ''),
                     content,
-                    cd.get('author_name', ''),
+                    new_author,
                     cd.get('author_id', ''),
                     cd.get('like_count', 0),
                     cd.get('screenshot_path', '')
@@ -274,8 +340,12 @@ class MySQLManager:
                 existing_texts.add(content)
 
             if not rows:
-                self.logger.info(f"[MySQL] 评论全部重复，跳过 article_id={article_id} (skipped={skipped})")
-                return 0
+                if updated > 0:
+                    conn.commit()
+                    self.logger.info(f"[MySQL] 评论补全 author_name {updated} 条 (跳过重复{skipped}条) article_id={article_id}")
+                else:
+                    self.logger.info(f"[MySQL] 评论全部重复，跳过 article_id={article_id} (skipped={skipped})")
+                return updated, self._fetch_comments_by_texts(cursor, article_id, requested_texts)
 
             cursor.executemany("""
                 INSERT INTO wb_comment (article_id, article_url, comment_id, content_text,
@@ -284,8 +354,27 @@ class MySQLManager:
             """, rows)
             conn.commit()
             count = cursor.rowcount
-            self.logger.info(f"[MySQL] 批量插入评论 {count} 条 (跳过重复{skipped}条) article_id={article_id}")
-            return count
+            self.logger.info(f"[MySQL] 批量插入评论 {count} 条 (跳过重复{skipped}条, 补全author_name {updated}条) article_id={article_id}")
+            return count, self._fetch_comments_by_texts(cursor, article_id, requested_texts)
+
+    def _fetch_comments_by_texts(self, cursor, article_id: int, texts: List[str]) -> List[Dict[str, Any]]:
+        unique_texts = [text for text in dict.fromkeys(texts) if text]
+        if not unique_texts:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        batch_size = 100
+        for offset in range(0, len(unique_texts), batch_size):
+            batch = unique_texts[offset:offset + batch_size]
+            placeholders = ",".join(["%s"] * len(batch))
+            cursor.execute(
+                f"""SELECT * FROM wb_comment
+                    WHERE article_id = %s AND content_text IN ({placeholders})
+                    ORDER BY id""",
+                [article_id] + batch,
+            )
+            rows.extend(cursor.fetchall())
+        return rows
 
     def save_semantic_analysis(self, analysis_data: Dict[str, Any]) -> int:
         with self.get_connection() as conn:

@@ -3,6 +3,9 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from core.base import BaseSkill
 from core.exceptions import CrawlerBaseException
@@ -18,6 +21,7 @@ from skills.comment_processor import CommentProcessor
 from skills.semantic_analyzer import SemanticAnalyzer
 from utils.logger import setup_logger as _setup_logger
 from utils.file_utils import clean_filename
+from utils.weibo_url_utils import same_weibo_detail_url
 from models.article_model import ArticleModel
 from models.comment_model import CommentModel
 from utils.mysql_manager import MySQLManager
@@ -248,11 +252,8 @@ class PipelineManager:
                 if self.mysql:
                     try:
                         article_id = self.mysql.save_article(article.to_dict())
-                        article_comments = [c for c in cleaned_comments if hasattr(c, 'article_url') and c.article_url == article.url]
-                        if article_comments:
-                            comments_data = [c.to_dict() for c in article_comments]
-                            self.mysql.save_comments_batch(comments_data, article_id)
-                        self._save_semantic_analysis(article, article_id)
+                        comment_rows = self._save_article_comments(article, article_id, cleaned_comments)
+                        self._save_semantic_analysis(article, article_id, comment_rows=comment_rows)
                     except Exception as db_err:
                         self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
 
@@ -382,11 +383,8 @@ class PipelineManager:
                 if self.mysql:
                     try:
                         article_id = self.mysql.save_article(article.to_dict())
-                        article_comments = [c for c in comments if hasattr(c, 'article_url') and c.article_url == article.url]
-                        if article_comments:
-                            comments_data = [c.to_dict() for c in article_comments]
-                            self.mysql.save_comments_batch(comments_data, article_id)
-                        self._save_semantic_analysis(article, article_id)
+                        comment_rows = self._save_article_comments(article, article_id, comments)
+                        self._save_semantic_analysis(article, article_id, comment_rows=comment_rows)
                     except Exception as db_err:
                         self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
             if comments:
@@ -399,7 +397,42 @@ class PipelineManager:
             if self.mysql:
                 self.mysql.close()
 
-    def _save_semantic_analysis(self, article: ArticleModel, article_id: int):
+    def _get_article_comments(self, article: ArticleModel, comments: List[CommentModel]) -> List[CommentModel]:
+        return [
+            comment for comment in comments
+            if hasattr(comment, 'article_url') and same_weibo_detail_url(comment.article_url, article.url)
+        ]
+
+    def _save_article_comments(
+        self,
+        article: ArticleModel,
+        article_id: int,
+        comments: List[CommentModel],
+    ) -> List[Dict[str, Any]]:
+        if not self.mysql:
+            return []
+
+        article_comments = self._get_article_comments(article, comments)
+        if not article_comments:
+            self.logger.info("[MySQL] 未找到匹配评论，跳过评论入库 article_id=%s url=%s", article_id, article.url)
+            return []
+
+        comments_data = [comment.to_dict() for comment in article_comments]
+        comment_rows = self.mysql.save_comments_batch_return_rows(comments_data, article_id)
+        self.logger.info(
+            "[MySQL] 文章评论已关联 article_id=%s matched=%s db_rows=%s",
+            article_id,
+            len(article_comments),
+            len(comment_rows),
+        )
+        return comment_rows
+
+    def _save_semantic_analysis(
+        self,
+        article: ArticleModel,
+        article_id: int,
+        comment_rows: Optional[List[Dict[str, Any]]] = None,
+    ):
         if not self.mysql or not self.semantic_analyzer or not self.semantic_analyzer.enabled:
             return
 
@@ -412,7 +445,8 @@ class PipelineManager:
         )
         self.mysql.save_semantic_analysis(article_analysis)
 
-        comment_rows = self.mysql.get_comments_by_article_id(article_id, limit=200)
+        if comment_rows is None:
+            comment_rows = self.mysql.get_comments_by_article_id(article_id, limit=200)
         comment_analyses = [
             self.semantic_analyzer.analyze_record(
                 row,
@@ -425,3 +459,325 @@ class PipelineManager:
         ]
         if comment_analyses:
             self.mysql.save_semantic_analysis_batch(comment_analyses)
+            self.logger.info("[MySQL] 评论语义分析已保存 article_id=%s count=%s", article_id, len(comment_analyses))
+
+    async def analyze_keyword_return(self, keyword: str, articles_per_kw: int = 3) -> Dict[str, Any]:
+        """
+        对单个热词执行全链路分析并返回结构化结果
+
+        流程：搜索博文 → 文章截图 → 评论采集+截图 → 语义分析 → 汇总返回
+
+        Args:
+            keyword: 热词名称
+            articles_per_kw: 每个关键词处理的文章数
+
+        Returns:
+            Dict: 包含 articles / comments / semantic_analysis / stats 的结构化结果
+        """
+        from collections import Counter
+
+        result = {
+            'keyword': keyword,
+            'status': 'completed',
+            'articles': [],
+            'comments': [],
+            'semantic_summary': {},
+            'stats': {'articles_count': 0, 'comments_count': 0, 'screenshots_count': 0},
+            'errors': [],
+        }
+
+        try:
+            self.logger.info(f"[KeywordAnalyze] 开始分析热词: {keyword}")
+            await self.browser.start_browser()
+
+            safe_kw = clean_filename(keyword[:20])
+
+            # Step 1: 搜索并采集微博卡片
+            cards_data, need_login = await self.content_collector.execute(keyword)
+            if need_login:
+                result['status'] = 'failed'
+                result['errors'].append('需要登录才能搜索')
+                return result
+            if not cards_data:
+                result['status'] = 'partial'
+                result['errors'].append(f'未找到关于「{keyword}」的微博卡片')
+                return result
+
+            self.logger.info(f"[KeywordAnalyze] 找到 {len(cards_data)} 条微博卡片")
+
+            # Step 2: 打开搜索页（用于文章处理器定位元素）
+            search_page = await self.browser.new_page()
+            from urllib.parse import quote
+            search_url = f"https://s.weibo.com/weibo?q={quote(keyword)}"
+            nav_success = await self.browser.navigate_to(search_page, search_url, wait_for='domcontentloaded')
+            if not nav_success:
+                await self.browser.close_page(search_page)
+                result['errors'].append('搜索页访问失败')
+                return result
+
+            await asyncio.sleep(4)
+            await self.browser.scroll_to_load_more(search_page, scroll_count=3, delay=2000)
+
+            articles = []
+            comments = []
+
+            # Step 3: 循环处理每条微博卡片
+            for card_idx, card_info in enumerate(cards_data[:articles_per_kw]):
+                try:
+                    # 3a. 文章处理 + 截图
+                    article_model = await self.article_processor.execute(
+                        search_page, card_info, keyword, card_idx, safe_kw
+                    )
+                    articles.append(article_model)
+                    self.logger.info(f"[KeywordAnalyze] [{card_idx+1}] 文章已处理: {article_model.author_name}")
+
+                    # 3b. 进入详情页获取评论 + 截图
+                    detail_url = card_info.get('detail_url', '')
+                    converted_url = ContentCollector.convert_detail_url(detail_url)
+                    valid_url = (
+                        converted_url and
+                        'weibo.com/' in converted_url and
+                        not converted_url.startswith('sinaweibo://')
+                    )
+
+                    if valid_url and card_info.get('comment_count', 0) > 0:
+                        detail_page = None
+                        try:
+                            detail_page = await self.browser.new_page()
+                            nav_ok = await self.browser.navigate_to(
+                                detail_page, converted_url, wait_for='domcontentloaded'
+                            )
+                            if nav_ok:
+                                await asyncio.sleep(5)
+                                page_comments = await self.comment_processor.execute(
+                                    detail_page, keyword, card_idx, safe_kw
+                                )
+                                comments.extend(page_comments)
+                                self.logger.info(f"[KeywordAnalyze] [{card_idx+1}] 获取 {len(page_comments)} 条评论")
+                            else:
+                                self.logger.warning(f"[KeywordAnalyze] 详情页访问失败")
+                            await self.browser.close_page(detail_page)
+                        except Exception as e:
+                            self.logger.warning(f"[KeywordAnalyze] 详情页评论截取出错: {e}")
+                            if detail_page:
+                                await self.browser.close_page(detail_page)
+
+                except Exception as e:
+                    error_msg = f"第{card_idx+1}条微博处理失败: {str(e)}"
+                    self.logger.warning(f"[KeywordAnalyze] {error_msg}")
+                    result['errors'].append(error_msg)
+                    continue
+
+            await self.browser.close_page(search_page)
+
+            # Step 4: 数据清洗与存储
+            cleaned_articles = self.data_extractor.execute(articles)
+            cleaned_comments = self.data_extractor.execute(comments)
+            db_article_ids: Dict[int, int] = {}
+            db_comment_rows_by_obj: Dict[int, Dict[str, Any]] = {}
+
+            for article in cleaned_articles:
+                self.storage.save_article_data(article, article.keyword)
+                if self.mysql:
+                    try:
+                        article_id = self.mysql.save_article(article.to_dict())
+                        db_article_ids[id(article)] = article_id
+                        article_comments = self._get_article_comments(article, cleaned_comments)
+                        comment_rows = self._save_article_comments(article, article_id, cleaned_comments)
+                        for comment in article_comments:
+                            for row in comment_rows:
+                                if row.get('content_text', '') == comment.content_text:
+                                    db_comment_rows_by_obj[id(comment)] = row
+                                    break
+                        self._save_semantic_analysis(article, article_id, comment_rows=comment_rows)
+                    except Exception as db_err:
+                        self.logger.error(f"[MySQL] 文章存储失败: {db_err}")
+                        result['errors'].append(f'数据库写入失败: {db_err}')
+
+            if cleaned_comments:
+                self.storage.save_comments_data(cleaned_comments, keyword)
+
+            # Step 5: 语义分析（对每篇文章和评论）
+            article_semantics = []
+            comment_semantics = []
+            article_sem_by_obj: Dict[int, Dict[str, Any]] = {}
+            comment_sem_by_obj: Dict[int, Dict[str, Any]] = {}
+
+            if self.semantic_analyzer and self.semantic_analyzer.enabled:
+                self.logger.info(f"[KeywordAnalyze] 开始语义分析...")
+                for article in cleaned_articles:
+                    try:
+                        article_id = db_article_ids.get(id(article), 0)
+                        analysis = self.semantic_analyzer.analyze_record(
+                            article,
+                            source_type='article',
+                            source_id=article_id,
+                            article_id=article_id,
+                            keyword=keyword,
+                        )
+                        analysis.pop('analysis', None)  # 移除原始嵌套，减小体积
+                        article_semantics.append(analysis)
+                        article_sem_by_obj[id(article)] = analysis
+                    except Exception as e:
+                        self.logger.warning(f"[KeywordAnalyze] 文章语义分析失败: {e}")
+
+                for comment in cleaned_comments:
+                    try:
+                        db_row = db_comment_rows_by_obj.get(id(comment), {})
+                        article_id = int(db_row.get('article_id') or 0)
+                        source_id = int(db_row.get('id') or 0)
+                        analysis = self.semantic_analyzer.analyze_record(
+                            comment,
+                            source_type='comment',
+                            source_id=source_id,
+                            article_id=article_id,
+                            keyword=keyword,
+                        )
+                        analysis.pop('analysis', None)
+                        comment_semantics.append(analysis)
+                        comment_sem_by_obj[id(comment)] = analysis
+                    except Exception as e:
+                        self.logger.warning(f"[KeywordAnalyze] 评论语义分析失败: {e}")
+
+            # Step 6: 构建返回数据
+            result_articles = []
+            for i, a in enumerate(cleaned_articles):
+                a_dict = a.to_dict()
+                sem = article_sem_by_obj.get(id(a), article_semantics[i] if i < len(article_semantics) else None)
+                a_dict['semantic'] = sem or {}
+                result_articles.append(a_dict)
+
+            result_comments = []
+            for j, c in enumerate(cleaned_comments):
+                c_dict = c.to_dict()
+                sem = comment_sem_by_obj.get(id(c), comment_semantics[j] if j < len(comment_semantics) else None)
+                c_dict['semantic'] = sem or {}
+                result_comments.append(c_dict)
+
+            # Step 7: 构建语义汇总统计
+            semantic_summary = self._build_semantic_summary(article_semantics, comment_semantics)
+
+            result['articles'] = result_articles
+            result['comments'] = result_comments
+            result['semantic_analysis'] = {
+                'article_analysis': article_semantics,
+                'comment_analysis': comment_semantics,
+                'summary': semantic_summary,
+            }
+            result['stats'] = {
+                'articles_count': len(result_articles),
+                'comments_count': len(result_comments),
+                'screenshots_count': len(result_articles) + len(result_comments),
+            }
+
+            if result['errors']:
+                result['status'] = 'partial'
+
+            self.logger.info(f"[KeywordAnalyze] 分析完成: {result['stats']}")
+
+        except Exception as e:
+            import traceback
+            self.logger.error(f"[KeywordAnalyze] 分析失败: {e}\n{traceback.format_exc()}")
+            result['status'] = 'failed'
+            result['errors'].append(str(e))
+        finally:
+            try:
+                await self.browser.close_browser()
+            except Exception:
+                pass
+            try:
+                self.crawler.close()
+            except Exception:
+                pass
+            if self.mysql:
+                try:
+                    self.mysql.close()
+                except Exception:
+                    pass
+
+        return result
+
+    def _build_semantic_summary(self, article_semantics: List[Dict], comment_semantics: List[Dict]) -> Dict[str, Any]:
+        """构建语义分析汇总统计"""
+        from collections import Counter
+
+        summary = {}
+
+        # 情绪分布
+        art_sentiments = Counter(a.get('sentiment_label', '未知') for a in article_semantics)
+        cmt_sentiments = Counter(c.get('sentiment_label', '未知') for c in comment_semantics)
+        summary['article_sentiment_dist'] = dict(art_sentiments)
+        summary['comment_sentiment_dist'] = dict(cmt_sentiments)
+
+        # 主要情绪分布
+        art_emotions = Counter(a.get('primary_emotion', '中性') for a in article_semantics)
+        cmt_emotions = Counter(c.get('primary_emotion', '中性') for c in comment_semantics)
+        summary['article_emotion_dist'] = dict(art_emotions.most_common(8))
+        summary['comment_emotion_dist'] = dict(cmt_emotions.most_common(8))
+
+        # 立场分布
+        all_stances = [s.get('stance_label', '中立') for s in (article_semantics + comment_semantics)]
+        summary['stance_dist'] = dict(Counter(all_stances).most_common(6))
+
+        # 价值标签 TOP
+        value_counter = Counter()
+        for s in article_semantics + comment_semantics:
+            for v in s.get('value_labels', []):
+                value_counter[v] += 1
+        summary['top_values'] = [{'label': k, 'count': v} for k, v in value_counter.most_common(10)]
+
+        # 观念标签 TOP
+        concept_counter = Counter()
+        for s in article_semantics + comment_semantics:
+            for c in s.get('concept_labels', []):
+                concept_counter[c] += 1
+        summary['top_concepts'] = [{'label': k, 'count': v} for k, v in concept_counter.most_common(10)]
+
+        # 高冲突评论筛选（冲突分 >= 0.4）
+        high_conflict = [
+            {'id': c.get('source_id'), 'conflict_score': c.get('conflict_score', {}),
+             'stance': c.get('stance_label', ''), 'sentiment': c.get('sentiment_label', ''),
+             'summary': c.get('summary', '')}
+            for c in comment_semantics
+            if isinstance(c.get('conflict_score'), (int, float)) and c.get('conflict_score', 0) >= 0.4
+        ]
+        # 也检查嵌套的 conflict.score
+        high_conflict_v2 = []
+        for c in comment_semantics:
+            cs = c.get('conflict_score', {})
+            score = cs.get('score', 0) if isinstance(cs, dict) else cs
+            if isinstance(score, (int, float)) and score >= 0.4:
+                high_conflict_v2.append({
+                    'id': c.get('source_id'),
+                    'conflict_score': score,
+                    'level': cs.get('level', '') if isinstance(cs, dict) else '',
+                    'stance': c.get('stance_label', ''),
+                    'sentiment': c.get('sentiment_label', ''),
+                    'summary': c.get('summary', ''),
+                })
+        summary['high_conflict_comments'] = high_conflict_v2 if high_conflict_v2 else high_conflict
+
+        # 冲突分统计
+        conflict_scores = []
+        for s in comment_semantics:
+            cs = s.get('conflict_score', {})
+            if isinstance(cs, dict):
+                conflict_scores.append(cs.get('score', 0))
+            elif isinstance(cs, (int, float)):
+                conflict_scores.append(cs)
+
+        if conflict_scores:
+            avg_conflict = sum(conflict_scores) / len(conflict_scores)
+            max_conflict = max(conflict_scores)
+            summary['conflict_stats'] = {
+                'avg_score': round(avg_conflict, 4),
+                'max_score': round(max_conflict, 4),
+                'total_analyzed': len(conflict_scores),
+            }
+        else:
+            summary['conflict_stats'] = {'avg_score': 0, 'max_score': 0, 'total_analyzed': 0}
+
+        summary['total_articles_analyzed'] = len(article_semantics)
+        summary['total_comments_analyzed'] = len(comment_semantics)
+
+        return summary

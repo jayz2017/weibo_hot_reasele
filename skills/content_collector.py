@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.base import BaseSkill
 from utils.file_utils import clean_filename, generate_filename, ensure_dir
+from utils.weibo_url_utils import normalize_weibo_detail_url
 
 
 class ContentCollector(BaseSkill):
@@ -116,7 +117,7 @@ class ContentCollector(BaseSkill):
                             data.index = i;
                             const card = useWbproScroller ? item.querySelector('.card-wrap') : item;
                             if (!card && useWbproScroller) continue;
-                            const nameEl = card.querySelector('.name, .W_fb, a[nick-name]');
+                            const nameEl = card.querySelector('.name, .W_fb, a[nick-name], a[href*="weibo.com/u/"], a[href*="weibo.com/n/"]');
                             data.author_name = nameEl ? nameEl.innerText.trim() : '';
                             const txtEl = card.querySelector('.txt, p[node-type="feed_list_content"]');
                             data.content_text = txtEl ? txtEl.innerText.trim() : '';
@@ -173,8 +174,4 @@ class ContentCollector(BaseSkill):
         Returns:
             str: 转换后的URL
         """
-        if detail_url and 'app.weibo.com/t/feed/' in detail_url:
-            feed_id = detail_url.split('/feed/')[-1].split('?')[0].split('#')[0]
-            if feed_id:
-                return f"https://weibo.com/detail/{feed_id}"
-        return detail_url
+        return normalize_weibo_detail_url(detail_url)

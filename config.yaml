@@ -88,6 +88,12 @@ pipeline:
   max_keywords: 5
   articles_per_keyword: 3
 
+keyword_analyze:
+  default_keywords: ["高考"]
+  default_articles_per_kw: 3
+  default_max_comments: 15
+  timeout_seconds: 300
+
 mysql:
   enabled: true
   host: "127.0.0.1"

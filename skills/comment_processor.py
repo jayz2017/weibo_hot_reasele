@@ -5,6 +5,7 @@ from typing import List, Any
 from core.base import BaseSkill
 from models.comment_model import CommentModel
 from utils.file_utils import generate_filename
+from utils.weibo_url_utils import normalize_weibo_detail_url
 
 
 class CommentProcessor(BaseSkill):
@@ -183,7 +184,7 @@ class CommentProcessor(BaseSkill):
 
                             const fullText = target.innerText || '';
 
-                            const userLink = target.querySelector('a[href*="weibo.com/u/"], a[href*="weibo.com/n/"]');
+                            const userLink = target.querySelector('a[href*="weibo.com/u/"], a[href*="weibo.com/n/"], a[class*="name"], a[class*="user"], .wbpro-scroller-item a[href*="/u/"]');
                             data.author_name = userLink ? userLink.innerText.trim() : '';
 
                             const contentEl = target.querySelector('.WB_text, .txt, [class*="text"], [class*="content"]');
@@ -191,6 +192,9 @@ class CommentProcessor(BaseSkill):
                                 var text = contentEl.innerText.trim();
                                 var colonIdx = text.indexOf(':');
                                 if (colonIdx >= 0 && colonIdx < 30) {{
+                                    if (!data.author_name) {{
+                                        data.author_name = text.substring(0, colonIdx).trim();
+                                    }}
                                     text = text.substring(colonIdx + 1).trim();
                                 }}
                                 data.content_text = text;
@@ -292,7 +296,7 @@ class CommentProcessor(BaseSkill):
                         continue
 
                     comment = CommentModel(
-                        article_url=page.url,
+                        article_url=normalize_weibo_detail_url(page.url),
                         comment_id=f"comment_{keyword[:10]}_{article_index}_{seq}",
                         content_text=comment_data.get('content_text', ''),
                         author_name=comment_data.get('author_name', ''),

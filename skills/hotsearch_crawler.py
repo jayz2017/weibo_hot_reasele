@@ -1,4 +1,3 @@
-import json
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
@@ -10,13 +9,13 @@ from utils.http_client import HTTPClient
 class HotSearchCrawler(BaseSkill):
     """
     热榜数据采集器 Skill 1
-    
+
     功能：
-    1. 请求微博热榜API获取实时数据
-    2. 解析JSON响应并转换为HotSearchModel对象列表
+    1. 请求微博热榜API获取实时数据（JSON接口）
+    2. 解析微博热搜页面HTML获取完整热点列表（含热度值）
     3. 数据验证和异常处理
     """
-    
+
     HOTSEARCH_API = "https://weibo.com/ajax/side/hotSearch"
     
     def __init__(self, config: Dict[str, Any], logger: logging.Logger):
@@ -135,3 +134,55 @@ class HotSearchCrawler(BaseSkill):
     def close(self):
         """关闭HTTP客户端"""
         self.http_client.close()
+
+    def fetch_hot_search_page(self) -> List[Dict[str, Any]]:
+        """
+        获取微博热搜完整列表（含内容与热度值）
+
+        通过 weibo.com/ajax/side/hotSearch 接口获取 realtime 数据，
+        返回格式化后的热搜列表：rank(排名), word(热点内容), num(热度值), label(标签)
+
+        Returns:
+            List[Dict]: 热点列表 [{rank, word, num, label, category}, ...]
+        """
+        self.logger.info(f"[{self.name}] 开始获取热搜页面数据: {self.HOTSEARCH_API}")
+
+        try:
+            response = self.http_client.get(self.HOTSEARCH_API)
+            json_data = response.json()
+
+            data = json_data.get('data', {})
+            if not isinstance(data, dict):
+                raise ParseError("API返回数据格式异常")
+
+            realtime = data.get('realtime', [])
+            if not isinstance(realtime, list) or len(realtime) == 0:
+                self.logger.warning(f"[{self.name}] 未找到realtime热搜数据")
+                return []
+
+            result = []
+            for item in realtime:
+                if not isinstance(item, dict):
+                    continue
+                result.append({
+                    'rank': item.get('realpos', item.get('rank', 0)),
+                    'word': item.get('word', ''),
+                    'num': item.get('num', 0),
+                    'label': item.get('label_name', item.get('icon_desc', '')),
+                    'category': item.get('category', ''),
+                    'note': item.get('note', ''),
+                    'is_ad': item.get('is_ad', False) or item.get('flag') == 3,
+                })
+
+            # 按排名排序
+            result.sort(key=lambda x: x['rank'])
+
+            self.logger.info(f"[{self.name}] 成功获取 {len(result)} 条热搜数据")
+            return result
+
+        except DataFetchError as e:
+            self.logger.error(f"[{self.name}] 热搜页面数据获取失败: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"[{self.name}] 热搜页面未知错误: {e}")
+            raise DataFetchError(f"热搜页面采集失败: {e}")

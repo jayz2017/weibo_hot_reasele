@@ -8,6 +8,8 @@ from models.article_model import ArticleModel
 from models.comment_model import CommentModel
 from utils.mysql_manager import MySQLManager
 from utils.file_utils import generate_filename, clean_filename
+from utils.date_utils import normalize_weibo_time, extract_weibo_title
+from utils.weibo_url_utils import normalize_weibo_detail_url, same_weibo_detail_url
 from core.base import BaseSkill
 from skills.semantic_analyzer import SemanticAnalyzer
 
@@ -65,11 +67,8 @@ class AuthorMonitor(BaseSkill):
                     for article in articles:
                         try:
                             article_id = self.mysql.save_article(article.to_dict())
-                            article_comments = [c for c in comments if hasattr(c, 'article_url') and c.article_url == article.url]
-                            if article_comments:
-                                comments_data = [c.to_dict() for c in article_comments]
-                                self.mysql.save_comments_batch(comments_data, article_id)
-                            self._save_semantic_analysis(article, article_id)
+                            comment_rows = self._save_article_comments(article, article_id, comments)
+                            self._save_semantic_analysis(article, article_id, comment_rows=comment_rows)
                         except Exception as db_err:
                             self.logger.error(f"[AuthorMonitor] MySQL存储失败: {db_err}")
 
@@ -93,17 +92,49 @@ class AuthorMonitor(BaseSkill):
             for article in articles:
                 try:
                     article_id = self.mysql.save_article(article.to_dict())
-                    article_comments = [c for c in comments if hasattr(c, 'article_url') and c.article_url == article.url]
-                    if article_comments:
-                        comments_data = [c.to_dict() for c in article_comments]
-                        self.mysql.save_comments_batch(comments_data, article_id)
-                    self._save_semantic_analysis(article, article_id)
+                    comment_rows = self._save_article_comments(article, article_id, comments)
+                    self._save_semantic_analysis(article, article_id, comment_rows=comment_rows)
                 except Exception as db_err:
                     self.logger.error(f"[AuthorMonitor] MySQL存储失败: {db_err}")
 
         return {"author_id": author_id, "articles": len(articles), "comments": len(comments)}
 
-    def _save_semantic_analysis(self, article: ArticleModel, article_id: int):
+    def _get_article_comments(self, article: ArticleModel, comments: List[CommentModel]) -> List[CommentModel]:
+        return [
+            comment for comment in comments
+            if hasattr(comment, 'article_url') and same_weibo_detail_url(comment.article_url, article.url)
+        ]
+
+    def _save_article_comments(
+        self,
+        article: ArticleModel,
+        article_id: int,
+        comments: List[CommentModel],
+    ) -> List[Dict[str, Any]]:
+        if not self.mysql:
+            return []
+
+        article_comments = self._get_article_comments(article, comments)
+        if not article_comments:
+            self.logger.info("[AuthorMonitor] 未找到匹配评论，跳过评论入库 article_id=%s url=%s", article_id, article.url)
+            return []
+
+        comments_data = [comment.to_dict() for comment in article_comments]
+        comment_rows = self.mysql.save_comments_batch_return_rows(comments_data, article_id)
+        self.logger.info(
+            "[AuthorMonitor] 文章评论已关联 article_id=%s matched=%s db_rows=%s",
+            article_id,
+            len(article_comments),
+            len(comment_rows),
+        )
+        return comment_rows
+
+    def _save_semantic_analysis(
+        self,
+        article: ArticleModel,
+        article_id: int,
+        comment_rows: Optional[List[Dict[str, Any]]] = None,
+    ):
         if not self.mysql or not self.semantic_analyzer or not self.semantic_analyzer.enabled:
             return
 
@@ -116,10 +147,11 @@ class AuthorMonitor(BaseSkill):
         )
         self.mysql.save_semantic_analysis(article_analysis)
 
-        comment_rows = self.mysql.get_comments_by_article_id(
-            article_id,
-            limit=max(self.max_comments_per_article * 3, 100),
-        )
+        if comment_rows is None:
+            comment_rows = self.mysql.get_comments_by_article_id(
+                article_id,
+                limit=max(self.max_comments_per_article * 3, 100),
+            )
         comment_analyses = [
             self.semantic_analyzer.analyze_record(
                 row,
@@ -132,6 +164,7 @@ class AuthorMonitor(BaseSkill):
         ]
         if comment_analyses:
             self.mysql.save_semantic_analysis_batch(comment_analyses)
+            self.logger.info("[AuthorMonitor] 评论语义分析已保存 article_id=%s count=%s", article_id, len(comment_analyses))
 
     def _get_author_ids_from_db(self) -> List[Dict[str, str]]:
         if not self.mysql:
@@ -236,8 +269,8 @@ class AuthorMonitor(BaseSkill):
             for i, post_info in enumerate(recent_posts[:self.max_articles_per_author]):
                 try:
                     content_text = post_info.get('content_text', '')
-                    detail_url = post_info.get('detail_url', '')
-                    publish_time = post_info.get('publish_time', '')
+                    detail_url = normalize_weibo_detail_url(post_info.get('detail_url', ''))
+                    publish_time = normalize_weibo_time(post_info.get('publish_time', ''))
 
                     if not detail_url or detail_url.startswith('sinaweibo://'):
                         self.logger.info(f"  ⏭ [{i+1}] 无有效详情URL，跳过")
@@ -261,7 +294,7 @@ class AuthorMonitor(BaseSkill):
                     if article_data:
                         article = ArticleModel(
                             keyword=f"author_monitor_{author_id}",
-                            title=content_text[:100],
+                            title=extract_weibo_title(content_text),
                             author_name=author_name,
                             author_id=author_id,
                             content_text=article_data.get('content_text', content_text)[:2000],
@@ -301,10 +334,7 @@ class AuthorMonitor(BaseSkill):
 
         try:
             # 处理特殊URL格式
-            if 'app.weibo.com/t/feed/' in detail_url:
-                feed_id = detail_url.split('/feed/')[-1].split('?')[0].split('#')[0]
-                if feed_id:
-                    detail_url = f"https://weibo.com/detail/{feed_id}"
+            detail_url = normalize_weibo_detail_url(detail_url)
 
             detail_page = await self.browser.new_page()
             nav_success = await self.browser.navigate_to(detail_page, detail_url, wait_for='domcontentloaded')
@@ -989,7 +1019,7 @@ class AuthorMonitor(BaseSkill):
                         continue
 
                     comment = CommentModel(
-                        article_url=page.url,
+                        article_url=normalize_weibo_detail_url(page.url),
                         comment_id=f"comment_author_{keyword[:10]}_{article_index}_{seq}",
                         content_text=content,
                         author_name=author,

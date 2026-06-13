@@ -4,6 +4,8 @@ from typing import Any
 
 from core.base import BaseSkill
 from models.article_model import ArticleModel
+from utils.date_utils import normalize_weibo_time, extract_weibo_title
+from utils.weibo_url_utils import normalize_weibo_detail_url
 
 
 class ArticleProcessor(BaseSkill):
@@ -21,7 +23,7 @@ class ArticleProcessor(BaseSkill):
         card_index = card_info['index']
         author_name = card_info.get('author_name', '')
         content_text = card_info.get('content_text', '')
-        detail_url = card_info.get('detail_url', '')
+        detail_url = normalize_weibo_detail_url(card_info.get('detail_url', ''))
 
         self.logger.info(f"    [{article_index + 1}] {author_name}: {content_text[:40]}...")
         self.logger.info(f"      detail_url=\"{detail_url}\"")
@@ -95,10 +97,10 @@ class ArticleProcessor(BaseSkill):
 
         article = ArticleModel(
             keyword=keyword,
-            title=content_text[:100],
+            title=extract_weibo_title(content_text),
             author_name=author_name,
             content_text=content_text[:2000],
-            publish_time=card_info.get('publish_time', ''),
+            publish_time=normalize_weibo_time(card_info.get('publish_time', '')),
             repost_count=card_info.get('repost_count', 0),
             comment_count=card_info.get('comment_count', 0),
             like_count=card_info.get('like_count', 0),

@@ -44,6 +44,11 @@ app = FastAPI(
 - 触发完整采集流水线
 - 异步执行状态查询
 
+### 6. 热词分析 (Keyword Analyze)
+- 输入热词，自动搜索博文、截图、采集评论
+- 评论语义分析（情绪/立场/价值观/观点/冲突分）
+- 返回结构化全量结果
+
 ## 技术栈
 - **框架**: FastAPI + Uvicorn
 - **数据库**: MySQL (pymysql)
@@ -102,6 +107,14 @@ class HotSearchItem(BaseModel):
     word_scheme: Optional[str] = Field(None, description="搜索词编码")
 
 
+class HotSearchPageItem(BaseModel):
+    rank: int = Field(..., description="排名")
+    word: str = Field(..., description="热点内容")
+    num: int = Field(..., description="热度值")
+    label: Optional[str] = Field(None, description="标签（新/热/沸等）")
+    category: Optional[str] = Field(None, description="分类")
+
+
 class ArticleItem(BaseModel):
     id: int
     url: str
@@ -153,11 +166,24 @@ class PipelineStatus(BaseModel):
     stats: Dict[str, Any] = {}
 
 
+class KeywordAnalyzeRequest(BaseModel):
+    keyword: str = Field(..., description="热词名称", min_length=1, max_length=100)
+    articles_per_kw: int = Field(3, ge=1, le=10, description="每个关键词处理的文章数")
+
+
 _pipeline_status = {
     "status": "idle",
     "running": False,
     "last_run": None,
     "stats": {},
+}
+
+_keyword_analyze_status = {
+    "running": False,
+    "keyword": None,
+    "status": "idle",
+    "result": None,
+    "started_at": None,
 }
 
 
@@ -171,6 +197,7 @@ async def root():
             {"path": "/api/health", "method": "GET", "desc": "健康检查"},
             {"path": "/api/hotsearch", "method": "GET", "desc": "获取热榜数据"},
             {"path": "/api/hotsearch/filter", "method": "GET", "desc": "过滤后的热词"},
+            {"path": "/api/hotsearch/page", "method": "GET", "desc": "热搜页面热点列表（含热度）"},
             {"path": "/api/articles", "method": "GET", "desc": "查询文章列表"},
             {"path": "/api/articles/{article_id}", "method": "GET", "desc": "查询单篇文章"},
             {"path": "/api/comments", "method": "GET", "desc": "查询评论列表"},
@@ -180,6 +207,8 @@ async def root():
             {"path": "/api/zhibo8/matches", "method": "GET", "desc": "查询比赛列表"},
             {"path": "/api/pipeline/run", "method": "POST", "desc": "触发采集流水线"},
             {"path": "/api/pipeline/status", "method": "GET", "desc": "流水线状态"},
+            {"path": "/api/keyword/analyze", "method": "POST", "desc": "热词全链路分析（博文+评论+语义）"},
+            {"path": "/api/keyword/status", "method": "GET", "desc": "热词分析任务状态"},
         ],
     }
 
@@ -226,6 +255,20 @@ async def get_filtered_keywords(
     return ResponseModel(data={
         "total_raw": len(raw_data),
         "total_filtered": len(filtered),
+        "items": result,
+    })
+
+
+@app.get("/api/hotsearch/page", tags=["热榜数据"], response_model=ResponseModel)
+async def get_hot_search_page(
+    top_n: int = Query(50, ge=1, le=100, description="返回前N条"),
+):
+    """从微博热搜页面获取热点列表（含完整热度值）"""
+    items = crawler.fetch_hot_search_page()
+    result = items[:top_n]
+    return ResponseModel(data={
+        "source": "https://weibo.com/hot/search",
+        "total": len(result),
         "items": result,
     })
 
@@ -365,6 +408,68 @@ async def run_pipeline(background_tasks: BackgroundTasks):
 @app.get("/api/pipeline/status", tags=["流水线"], response_model=ResponseModel)
 async def pipeline_status():
     return ResponseModel(data=_pipeline_status)
+
+
+async def _run_keyword_analyze_async(req: KeywordAnalyzeRequest):
+    global _keyword_analyze_status
+    try:
+        _keyword_analyze_status["running"] = True
+        _keyword_analyze_status["keyword"] = req.keyword
+        _keyword_analyze_status["status"] = "running"
+        _keyword_analyze_status["started_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _keyword_analyze_status["result"] = None
+
+        from core.pipeline import PipelineManager
+        pm = PipelineManager("config.yaml")
+        result = await pm.analyze_keyword_return(
+            keyword=req.keyword,
+            articles_per_kw=req.articles_per_kw,
+        )
+
+        _keyword_analyze_status["result"] = result
+        _keyword_analyze_status["status"] = result.get("status", "completed")
+        logger.info(f"[API] 热词分析完成: {req.keyword} -> {result['stats']}")
+    except Exception as e:
+        logger.error(f"[API] 热词分析失败: {e}")
+        _keyword_analyze_status["status"] = f"error: {str(e)}"
+    finally:
+        _keyword_analyze_status["running"] = False
+
+
+@app.post("/api/keyword/analyze", tags=["热词分析"], response_model=ResponseModel)
+async def analyze_keyword(req: KeywordAnalyzeRequest, background_tasks: BackgroundTasks):
+    """
+    对热词执行全链路分析
+
+    流程：搜索微博博文 → 文章内容截图 → 进入详情页采集评论 → 评论截图
+         → 8维语义分析（情绪/立场/价值观/观念/观点/冲突分）→ 返回结构化结果
+    """
+    global _keyword_analyze_status
+    if _keyword_analyze_status["running"]:
+        raise HTTPException(status_code=409, detail="已有热词分析任务正在运行中，请稍后再试")
+
+    background_tasks.add_task(_run_keyword_analyze_async, req)
+    return ResponseModel(
+        message=f"热词「{req.keyword}」分析已启动（后台异步执行）",
+        data={"keyword": req.keyword, "articles_per_kw": req.articles_per_kw, "status": "running"},
+    )
+
+
+@app.get("/api/keyword/status", tags=["热词分析"], response_model=ResponseModel)
+async def keyword_analyze_status():
+    """查询热词分析任务的执行状态和结果"""
+    status_data = dict(_keyword_analyze_status)
+    # 如果有结果且数据量大，只返回摘要信息
+    result = status_data.get("result")
+    if isinstance(result, dict) and result.get("stats"):
+        status_data["result_summary"] = {
+            "keyword": result.get("keyword"),
+            "status": result.get("status"),
+            "stats": result.get("stats"),
+            "errors_count": len(result.get("errors", [])),
+            "semantic_summary_keys": list(result.get("semantic_analysis", {}).get("summary", {}).keys()) if result.get("semantic_analysis") else [],
+        }
+    return ResponseModel(data=status_data)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,11 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Tuple
 
-import jieba
-import jieba.analyse
+try:
+    import jieba
+    import jieba.analyse
+except ImportError:
+    jieba = None
 
 from core.base import BaseSkill
 
@@ -87,6 +90,8 @@ class SemanticAnalyzer(BaseSkill):
 
     def _initialize(self):
         self.logger.info(f"[{self.name}] 中文语义分析器初始化完成")
+        if jieba is None:
+            self.logger.warning(f"[{self.name}] 未安装 jieba，已启用正则分词降级模式")
 
     def execute(self, raw_data: Any, source_type: str = "article", **kwargs) -> Any:
         if isinstance(raw_data, list):
@@ -201,7 +206,8 @@ class SemanticAnalyzer(BaseSkill):
 
     def _tokenize(self, text: str) -> List[str]:
         tokens = []
-        for token in jieba.lcut(text):
+        raw_tokens = jieba.lcut(text) if jieba else self._regex_tokenize(text)
+        for token in raw_tokens:
             token = token.strip()
             if len(token) < 2 and token not in {"赞", "牛", "好", "差"}:
                 continue
@@ -210,12 +216,28 @@ class SemanticAnalyzer(BaseSkill):
             tokens.append(token)
         return tokens
 
+    def _regex_tokenize(self, text: str) -> List[str]:
+        words = re.findall(r"[\u4e00-\u9fff]{1,4}|[A-Za-z0-9_]+", text)
+        phrase_hits = []
+        lexicons = [
+            self.POSITIVE_WORDS,
+            self.NEGATIVE_WORDS,
+            self.NEGATIONS,
+            set(self.OPINION_CUES),
+        ]
+        for lexicon in lexicons:
+            phrase_hits.extend(word for word in lexicon if word and word in text)
+        return words + phrase_hits
+
     def _extract_keywords(self, text: str) -> List[str]:
         try:
-            words = [
-                word for word in jieba.analyse.extract_tags(text, topK=self.keyword_top_k * 2)
-                if len(word) >= 2 and not word.isdigit()
-            ]
+            if jieba:
+                words = [
+                    word for word in jieba.analyse.extract_tags(text, topK=self.keyword_top_k * 2)
+                    if len(word) >= 2 and not word.isdigit()
+                ]
+            else:
+                words = []
         except Exception:
             words = []
         if words:

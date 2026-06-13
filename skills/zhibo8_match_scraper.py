@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from models.zhibo8_comment_model import Zhibo8CommentModel
 from utils.mysql_manager import MySQLManager
 from utils.file_utils import generate_filename, clean_filename
+from utils.date_utils import normalize_weibo_time
 from core.base import BaseSkill
 
 
@@ -313,7 +314,7 @@ class Zhibo8MatchScraper(BaseSkill):
                     content_text=rc.get('content_text', ''),
                     like_count=rc.get('like_count', 0),
                     reply_count=rc.get('reply_count', 0),
-                    publish_time=rc.get('publish_time', ''),
+                    publish_time=normalize_weibo_time(rc.get('publish_time', '')),
                 )
                 comments.append(comment)
 
@@ -418,7 +419,7 @@ class Zhibo8MatchScraper(BaseSkill):
                         content_text=content_text,
                         like_count=like_count,
                         reply_count=reply_count,
-                        publish_time=pub_time,
+                        publish_time=normalize_weibo_time(pub_time),
                     )
                     comments.append(comment)
                     self.logger.info(f"  📋 [正则-{mi}] @{author}: \"{content_text[:60]}\" 顶={like_count} 踩={reply_count}")
@@ -438,7 +439,7 @@ class Zhibo8MatchScraper(BaseSkill):
                         content_text='',
                         like_count=like_count,
                         reply_count=reply_count,
-                        publish_time=pub_time,
+                        publish_time=normalize_weibo_time(pub_time),
                     )
                     comments.append(comment)
 
