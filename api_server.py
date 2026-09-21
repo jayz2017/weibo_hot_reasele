@@ -171,6 +171,12 @@ class KeywordAnalyzeRequest(BaseModel):
     articles_per_kw: int = Field(3, ge=1, le=10, description="每个关键词处理的文章数")
 
 
+class HotSearchAnalyzeAllRequest(BaseModel):
+    top_n: int = Field(0, ge=0, le=50, description="处理的热点数量，0表示全部")
+    articles_per_kw: int = Field(3, ge=1, le=10, description="每个热点处理的文章数")
+    skip_keywords: Optional[List[str]] = Field(None, description="需要跳过的热词列表")
+
+
 _pipeline_status = {
     "status": "idle",
     "running": False,
@@ -184,6 +190,20 @@ _keyword_analyze_status = {
     "status": "idle",
     "result": None,
     "started_at": None,
+}
+
+_hotsearch_analyze_all_status = {
+    "running": False,
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "total": 0,
+    "completed": 0,
+    "failed": 0,
+    "current_keyword": None,
+    "keywords": [],
+    "results": [],
+    "errors": [],
 }
 
 
@@ -209,6 +229,8 @@ async def root():
             {"path": "/api/pipeline/status", "method": "GET", "desc": "流水线状态"},
             {"path": "/api/keyword/analyze", "method": "POST", "desc": "热词全链路分析（博文+评论+语义）"},
             {"path": "/api/keyword/status", "method": "GET", "desc": "热词分析任务状态"},
+            {"path": "/api/hotsearch/analyze_all", "method": "POST", "desc": "批量分析当前所有热点"},
+            {"path": "/api/hotsearch/analyze_all/status", "method": "GET", "desc": "批量热点分析进度"},
         ],
     }
 
@@ -470,6 +492,129 @@ async def keyword_analyze_status():
             "semantic_summary_keys": list(result.get("semantic_analysis", {}).get("summary", {}).keys()) if result.get("semantic_analysis") else [],
         }
     return ResponseModel(data=status_data)
+
+
+async def _run_hotsearch_analyze_all_async(req: HotSearchAnalyzeAllRequest):
+    """批量分析所有微博热点：获取热点列表 → 依次执行全链路分析"""
+    global _hotsearch_analyze_all_status, _keyword_analyze_status
+    try:
+        _hotsearch_analyze_all_status["running"] = True
+        _hotsearch_analyze_all_status["status"] = "fetching_hotsearch"
+        _hotsearch_analyze_all_status["started_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _hotsearch_analyze_all_status["finished_at"] = None
+        _hotsearch_analyze_all_status["current_keyword"] = None
+        _hotsearch_analyze_all_status["keywords"] = []
+        _hotsearch_analyze_all_status["results"] = []
+        _hotsearch_analyze_all_status["errors"] = []
+        _hotsearch_analyze_all_status["completed"] = 0
+        _hotsearch_analyze_all_status["failed"] = 0
+        _hotsearch_analyze_all_status["total"] = 0
+
+        # 1. 获取热点列表
+        hot_items = crawler.fetch_hot_search_page()
+        # 过滤广告
+        hot_items = [item for item in hot_items if not item.get('is_ad', False)]
+        keywords = [item['word'] for item in hot_items if item.get('word')]
+        if req.skip_keywords:
+            keywords = [kw for kw in keywords if kw not in req.skip_keywords]
+        if req.top_n > 0:
+            keywords = keywords[:req.top_n]
+
+        _hotsearch_analyze_all_status["keywords"] = keywords
+        _hotsearch_analyze_all_status["total"] = len(keywords)
+        _hotsearch_analyze_all_status["status"] = "analyzing"
+
+        if not keywords:
+            _hotsearch_analyze_all_status["status"] = "completed"
+            _hotsearch_analyze_all_status["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            logger.warning("[API] 批量分析无可用热词")
+            return
+
+        logger.info(f"[API] 批量分析开始，共 {len(keywords)} 个热词: {keywords}")
+
+        for idx, kw in enumerate(keywords, 1):
+            _hotsearch_analyze_all_status["current_keyword"] = kw
+            # 占用单任务状态以保持互斥
+            _keyword_analyze_status["running"] = True
+            _keyword_analyze_status["keyword"] = kw
+            _keyword_analyze_status["status"] = "running"
+            _keyword_analyze_status["started_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            _keyword_analyze_status["result"] = None
+            try:
+                from core.pipeline import PipelineManager
+                pm = PipelineManager("config.yaml")
+                result = await pm.analyze_keyword_return(
+                    keyword=kw,
+                    articles_per_kw=req.articles_per_kw,
+                )
+                kw_status = result.get("status", "completed")
+                _hotsearch_analyze_all_status["results"].append({
+                    "keyword": kw,
+                    "status": kw_status,
+                    "stats": result.get("stats", {}),
+                    "errors": result.get("errors", []),
+                })
+                # 只有 status 为 completed/partial 才算成功；failed 计入失败
+                if kw_status == "failed":
+                    _hotsearch_analyze_all_status["failed"] += 1
+                else:
+                    _hotsearch_analyze_all_status["completed"] += 1
+                logger.info(f"[API] 批量分析进度 {idx}/{len(keywords)}: 「{kw}」状态={kw_status}")
+            except Exception as e:
+                _hotsearch_analyze_all_status["errors"].append({"keyword": kw, "error": str(e)})
+                _hotsearch_analyze_all_status["failed"] += 1
+                logger.error(f"[API] 批量分析热词「{kw}」失败: {e}")
+            finally:
+                _keyword_analyze_status["running"] = False
+
+        _hotsearch_analyze_all_status["status"] = "completed"
+        _hotsearch_analyze_all_status["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _hotsearch_analyze_all_status["current_keyword"] = None
+        logger.info(
+            f"[API] 批量分析全部结束: 成功 {_hotsearch_analyze_all_status['completed']}, "
+            f"失败 {_hotsearch_analyze_all_status['failed']}"
+        )
+    except Exception as e:
+        logger.error(f"[API] 批量分析任务异常: {e}")
+        _hotsearch_analyze_all_status["status"] = f"error: {str(e)}"
+        _hotsearch_analyze_all_status["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    finally:
+        _hotsearch_analyze_all_status["running"] = False
+        _keyword_analyze_status["running"] = False
+
+
+@app.post("/api/hotsearch/analyze_all", tags=["热榜数据"], response_model=ResponseModel)
+async def analyze_all_hotsearch(req: HotSearchAnalyzeAllRequest, background_tasks: BackgroundTasks):
+    """
+    批量分析当前微博所有热点
+
+    流程：
+    1. 调用微博热搜接口获取当前所有实时热点
+    2. 对每个热词依次执行全链路分析（搜索博文 → 截图 → 采集评论 → 语义分析）
+    3. 后台异步执行，通过 /api/hotsearch/analyze_all/status 查询进度
+    """
+    global _hotsearch_analyze_all_status, _keyword_analyze_status
+    if _hotsearch_analyze_all_status["running"]:
+        raise HTTPException(status_code=409, detail="批量热点分析任务正在运行中，请稍后再试")
+    if _keyword_analyze_status["running"]:
+        raise HTTPException(status_code=409, detail="已有单个热词分析任务正在运行中，请稍后再试")
+
+    background_tasks.add_task(_run_hotsearch_analyze_all_async, req)
+    return ResponseModel(
+        message="批量热点分析已启动（后台异步执行）",
+        data={
+            "top_n": req.top_n,
+            "articles_per_kw": req.articles_per_kw,
+            "status": "running",
+            "status_endpoint": "/api/hotsearch/analyze_all/status",
+        },
+    )
+
+
+@app.get("/api/hotsearch/analyze_all/status", tags=["热榜数据"], response_model=ResponseModel)
+async def hotsearch_analyze_all_status():
+    """查询批量热点分析任务的执行进度和结果"""
+    return ResponseModel(data=_hotsearch_analyze_all_status)
 
 
 if __name__ == "__main__":

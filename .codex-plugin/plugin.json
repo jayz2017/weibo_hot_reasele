@@ -1,0 +1,28 @@
+﻿{
+  "id": "weibo-hot-reasele-skill",
+  "name": "微博热榜爬虫项目技能",
+  "version": "1.0.0",
+  "description": "微博热榜爬虫系统(weibo_hot_reasele)的项目结构技能树，帮助AI快速理解项目架构并精准定位修改目标。涵盖12个Skill模块、4个数据模型、7个工具模块、6个入口文件和完整配置树。",
+  "skills": [
+    {
+      "name": "weibo_project_skill",
+      "path": "./skills/ai/weibo_project_skill.md",
+      "description": "微博热榜爬虫系统的完整项目技能描述，包含目录结构、各文件职责、修改指引和配置速查。",
+      "triggers": [
+        "weibo",
+        "热榜",
+        "hotsearch",
+        "微博",
+        "爬虫",
+        "pipeline",
+        "截图",
+        "语义分析",
+        "作者监控",
+        "直播吧",
+        "zhibo8",
+        "keyword_analyze",
+        "流水线"
+      ]
+    }
+  ]
+}
